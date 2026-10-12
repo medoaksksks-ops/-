@@ -1,0 +1,42 @@
+{
+  "firebaseUrl": "https://dr-gamal-357a2-default-rtdb.firebaseio.com",
+  "coursatkToken": "",
+  "siteName": "كورساتك",
+  "packages": [
+    {
+      "id": "month",
+      "name": "باقة الشهر — 30 يوم",
+      "price": 200,
+      "days": 30,
+      "hours": 0,
+      "active": true
+    },
+    {
+      "id": "term",
+      "name": "باقة الترم — لحد شهر 1",
+      "price": 500,
+      "days": 90,
+      "hours": 0,
+      "active": true
+    },
+    {
+      "id": "year",
+      "name": "باقة السنة — السنة كلها بالمراجعات النهائية",
+      "price": 900,
+      "days": 365,
+      "hours": 0,
+      "active": true
+    }
+  ],
+  "agents": [
+    {
+      "id": "ag1",
+      "name": "الدعم",
+      "telegram": "",
+      "active": true
+    }
+  ],
+  "updatedAt": 0,
+  "firebaseProjectId": "dr-gamal-357a2",
+  "firebaseApiKey": "AIzaSyDHr7ordQr3CmnZHnh90trTbDzUeoUiJnU"
+}
