@@ -431,7 +431,8 @@ function getFirebaseUrl() {
 }
 
 function getCoursatkTokenSync() {
-  return runtime.coursatkToken || process.env.COURSATK_TOKEN || CONFIG.COURSATK_TOKEN || "";
+  // Railway env أولاً عشان ما يتسحش لو اللوحة حفظت فاضي
+  return process.env.COURSATK_TOKEN || runtime.coursatkToken || CONFIG.COURSATK_TOKEN || "";
 }
 
 loadRuntimeFile();
@@ -796,9 +797,10 @@ async function getStorageBucket() {
 }
 
 function getCoursatkToken() {
-  // priority: runtime file → env (Firebase async load happens separately)
+  // Railway env أولاً، بعدين runtime/Firebase
+  if (process.env.COURSATK_TOKEN) return process.env.COURSATK_TOKEN;
   if (runtime.coursatkToken) return runtime.coursatkToken;
-  return process.env.COURSATK_TOKEN || CONFIG.COURSATK_TOKEN || "";
+  return CONFIG.COURSATK_TOKEN || "";
 }
 
 async function refreshCoursatkTokenFromFb() {
@@ -1704,8 +1706,9 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
             filtered.push(s);
           }
         }
-        // if upstream had no chem/math names, still append Thanawica ones
+        // لو كورساتك مفيش كيميا/رياضة بالاسم، ضيف نسخ ثناويكا بس (مش باقي مواد ثناويكا)
         for (const [kind, th] of thByKind) {
+          if (kind !== "chemistry" && kind !== "math") continue;
           const has = filtered.some((x) => chemMathKind(x.name) === kind || x._kind === kind);
           if (!has) filtered.push({ ...th, order_index: filtered.length + 1 });
         }
