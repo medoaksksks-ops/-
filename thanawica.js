@@ -591,16 +591,51 @@ export async function thLectures(chapterId) {
   const html = await getHtml(`/chapters/${th}`);
   const flight = extractFlight(html) + "\n" + html;
   const rows = parseArticleList(flight, "/lectures/", ["الفيديوهات", "فيديوهات", "فيديو", "ملفات"]);
-  const lectures = rows.map((r) => ({
-    id: encodeThId(r.id),
-    name: r.name || `محاضرة ${r.id}`,
-    image_url: r.image_url || null,
-    chapter_id: encodeThId(th),
-    videos_count: r.count != null ? r.count : null,
-    count: r.count != null ? r.count : null,
-    _source: "thanawica",
-    _thId: r.id
-  }));
+
+  // بطاقة المحاضرة: 2 فيديو / 3 ملفات / 1 امتحان — غالبًا بدون صورة
+  const metaById = new Map();
+  const parts = String(flight).split(/\["\$","article","(\d+)"/);
+  for (let i = 1; i < parts.length; i += 2) {
+    const id = Number(parts[i]);
+    if (!isSaneId(id)) continue;
+    const block = parts[i + 1] || "";
+    const meta = { videos_count: null, files_count: null, exams_count: null, image_url: null };
+    const img = block.match(/src":"(https:\/\/thanawica\.com\/api\/media\/[^"]+)"/);
+    if (img) meta.image_url = img[1];
+    const v = block.match(/children":(\d+)[\s\S]{0,120}?children":"فيديو"/);
+    if (v) meta.videos_count = Number(v[1]);
+    const f = block.match(/children":(\d+)[\s\S]{0,120}?children":"ملفات"/);
+    if (f) meta.files_count = Number(f[1]);
+    const e = block.match(/children":(\d+)[\s\S]{0,120}?children":"امتحان"/);
+    if (e) meta.exams_count = Number(e[1]);
+    if (meta.videos_count == null) {
+      const v2 = block.match(/children":"فيديو"[\s\S]{0,80}?children":(\d+)/);
+      if (v2) meta.videos_count = Number(v2[1]);
+    }
+    if (meta.files_count == null) {
+      const f2 = block.match(/children":"ملفات"[\s\S]{0,80}?children":(\d+)/);
+      if (f2) meta.files_count = Number(f2[1]);
+    }
+    metaById.set(id, meta);
+  }
+
+  const lectures = rows.map((r) => {
+    const meta = metaById.get(r.id) || {};
+    const videosCount =
+      meta.videos_count != null ? meta.videos_count : r.count != null ? r.count : null;
+    return {
+      id: encodeThId(r.id),
+      name: r.name || `محاضرة ${r.id}`,
+      image_url: meta.image_url || r.image_url || null,
+      chapter_id: encodeThId(th),
+      videos_count: videosCount,
+      files_count: meta.files_count != null ? meta.files_count : null,
+      exams_count: meta.exams_count != null ? meta.exams_count : null,
+      count: videosCount,
+      _source: "thanawica",
+      _thId: r.id
+    };
+  });
   cset(ck, lectures, 3 * 60_000);
   return lectures;
 }
