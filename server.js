@@ -664,8 +664,8 @@ function randomToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString("base64url");
 }
 
-function randomCode9() {
-  // 1000000 – 9999999
+function randomCode7() {
+  // 1000000 – 9999999 (7 أرقام)
   return String(Math.floor(1000000 + Math.random() * 9000000));
 }
 
@@ -1414,8 +1414,8 @@ app.post("/api/auth/login", rateLimit({ max: 30, windowMs: 60_000, scope: "stude
     const deviceName = String(req.body?.deviceName || "Unknown").slice(0, 80);
     const ip = clientIp(req);
 
-    if (!/^\d{9}$/.test(code)) {
-      return jsonError(res, 400, "الكود يجب أن يكون 9 أرقام");
+    if (!/^\d{7}$/.test(code)) {
+      return jsonError(res, 400, "الكود يجب أن يكون 7 أرقام");
     }
     if (!deviceId || deviceId.length < 8) {
       return jsonError(res, 400, "deviceId مطلوب");
@@ -2570,12 +2570,12 @@ app.post("/api/admin/students/import", requireAdmin("students_create"), async (r
       try {
         // Accept English or Arabic column names (لوحة التحكم)
         let code = String(row.code || row["الكود"] || "").replace(/\D/g, "");
-        if (code.length < 7) {
+        if (code.length > 7) code = code.slice(-7);
+        if (!/^\d{7}$/.test(code)) {
           failed++;
-          errors.push({ code: row.code || row["الكود"], error: "كود غير صالح" });
+          errors.push({ code: row.code || row["الكود"], error: "الكود يجب 7 أرقام" });
           continue;
         }
-        if (code.length < 9) code = code.padStart(9, "0");
 
         const name = String(row.name || row["الاسم"] || "بدون اسم").trim().slice(0, 120);
         const sectionRaw = row.section || row["الشعبة"] || "";
@@ -2679,12 +2679,12 @@ app.post("/api/admin/students", requireAdmin("students_create"), async (req, res
     }
 
     if (code) {
-      if (!/^\d{9}$/.test(code)) return jsonError(res, 400, "الكود يجب 9 أرقام");
+      if (!/^\d{7}$/.test(code)) return jsonError(res, 400, "الكود يجب 7 أرقام");
       const exists = await fbGet(`students/${code}`);
       if (exists) return jsonError(res, 409, "الكود مستخدم بالفعل");
     } else {
       for (let i = 0; i < 30; i++) {
-        code = randomCode9();
+        code = randomCode7();
         const exists = await fbGet(`students/${code}`);
         if (!exists) break;
       }
@@ -2802,6 +2802,45 @@ app.delete("/api/admin/students/:code", requireAdmin("students_delete"), async (
     }
     await fbDelete(`students/${code}`);
     res.json({ success: true });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/**
+ * تنظيف قاعدة البيانات: مسح كل الأكواد + جلسات الطلاب
+ * الشعب (sections) والأدمن والإعدادات بتفضل زي ما هي
+ * body: { confirm: "PURGE" }
+ */
+app.post("/api/admin/database/purge", requireAdmin("students_delete"), async (req, res) => {
+  try {
+    if (String(req.body?.confirm || "").trim() !== "PURGE") {
+      return jsonError(res, 400, 'للتأكيد ابعت confirm: "PURGE"');
+    }
+
+    const students = (await fbGet("students")) || {};
+    const sessions = (await fbGet("sessions")) || {};
+    const studentCount = Object.keys(students).length;
+    const sessionCount = Object.keys(sessions).length;
+
+    // مسح جماعي من Firebase (العقدة كلها) — أسرع من حذف واحد واحد
+    await fbDelete("students");
+    await fbDelete("sessions");
+
+    // تنظيف الكاش في الذاكرة
+    studentSessions.clear();
+    authCache.clear();
+    badTokens.clear();
+
+    res.json({
+      success: true,
+      message: "تم تنظيف قاعدة البيانات (الأكواد والجلسات) — الشعب محفوظة",
+      data: {
+        deletedStudents: studentCount,
+        deletedSessions: sessionCount,
+        kept: ["sections", "admins", "config", "sales"]
+      }
+    });
   } catch (e) {
     jsonError(res, 500, e.message);
   }
