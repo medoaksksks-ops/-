@@ -1,5 +1,7 @@
 /**
  * Coursatk API — protected backend
+ * VERSION v1.1 — scaling & stability (shared video sources, segment cache, request coalescing,
+ *                upstream/Firebase timeouts, auth cache, crash guards, sliding stream sessions)
  * - Student codes (7-digit) + devices + sessions in Firebase RTDB
  * - Admin panel API (users, permissions, sections, subject IDs)
  * - Stream-Weave key unwrap + AES-128 segment decrypt (upstream token NEVER leaves server)
@@ -13,16 +15,173 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
+import {
+  thanawicaLogin,
+  thSubjectsForYear,
+  thTeachers,
+  thChapters,
+  thLectures,
+  thLectureContent,
+  thGetVideoSource,
+  thMintAndFetchSegment,
+  thResolvePlaylistHash,
+  isChemOrMathName,
+  chemMathKind,
+  isThId,
+  encodeThId,
+  decodeThId,
+  getThanawicaSessionInfo
+} from "./thanawica.js";
+
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
+const APP_VERSION = "v1.1";
+
+// ═══════════════════════════════════════════════════════════
+// Crash guards — أي خطأ غير متوقع يتسجل بدل ما السيرفر يقع (ويضيّع كل جلسات التشغيل)
+// ═══════════════════════════════════════════════════════════
+process.on("unhandledRejection", (r) => console.error("[unhandledRejection]", (r && r.stack) || r));
+process.on("uncaughtException", (e) => console.error("[uncaughtException]", (e && e.stack) || e));
+
+function wrapAsync(fn) {
+  return function (req, res, next) {
+    try {
+      const r = fn(req, res, next);
+      if (r && typeof r.catch === "function") r.catch(next);
+    } catch (e) {
+      next(e);
+    }
+  };
+}
+
 const app = express();
+// Express 4 مبيمسكش أخطاء الـ async handlers → كانت بتعمل unhandledRejection وتقفّل السيرفر. نلفّهم كلهم.
+for (const m of ["get", "post", "put", "patch", "delete", "use"]) {
+  const orig = app[m].bind(app);
+  app[m] = (...args) => {
+    if (m === "get" && args.length === 1) return orig(...args); // app.get('setting')
+    return orig(...args.map((a) => (typeof a === "function" && a.length < 4 ? wrapAsync(a) : a)));
+  };
+}
 app.set("trust proxy", 1);
 app.use(cors({ origin: true, credentials: false }));
 app.use(express.json({ limit: "20mb" }));
-app.use(compression());
+app.use(
+  compression({
+    // مقاطع الفيديو مش بتتضغط — بلاش نصرف CPU عليها
+    filter: (req, res) => (req.path.startsWith("/api/stream/segment/") ? false : compression.filter(req, res))
+  })
+);
+
+// ═══════════════════════════════════════════════════════════
+// Scaling helpers: fetch مع timeout/retry، دمج الطلبات المتطابقة، حد للاتصالات المتوازية
+// ═══════════════════════════════════════════════════════════
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fetchT(url, opts = {}, { timeout = 15_000, retries = 0, retryOn = [429, 502, 503, 504] } = {}) {
+  let lastErr;
+  for (let a = 0; a <= retries; a++) {
+    try {
+      const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(timeout) });
+      if (a < retries && retryOn.includes(r.status)) {
+        try { await r.arrayBuffer(); } catch {}
+        lastErr = new Error("HTTP " + r.status);
+        await delay(200 * (a + 1) + Math.random() * 150);
+        continue;
+      }
+      return r;
+    } catch (e) {
+      lastErr = e && e.name === "TimeoutError" ? new Error(`timeout ${timeout}ms`) : e;
+      if (a < retries) {
+        await delay(200 * (a + 1) + Math.random() * 150);
+        continue;
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// 100 طالب بيطلبوا نفس الحاجة في نفس اللحظة → طلب واحد بس بيروح، والباقي بيستنى نفس النتيجة
+const inflight = new Map();
+function coalesce(key, fn) {
+  const hit = inflight.get(key);
+  if (hit) return hit;
+  const p = Promise.resolve()
+    .then(fn)
+    .finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
+
+// حد أقصى لعدد الاتصالات المتوازية على السيرفر الأصلي (الباقي بيستنى في طابور بدل ما يضغط عليه)
+function makeLimiter(max, maxQueue = 3000) {
+  let active = 0;
+  const q = [];
+  const pump = () => {
+    while (active < max && q.length) {
+      const { fn, res, rej } = q.shift();
+      active++;
+      Promise.resolve()
+        .then(fn)
+        .then(res, rej)
+        .finally(() => {
+          active--;
+          pump();
+        });
+    }
+  };
+  const run = (fn) =>
+    new Promise((res, rej) => {
+      if (q.length >= maxQueue) {
+        const e = new Error("السيرفر مشغول جدًا — جرّب بعد لحظات");
+        e.status = 503;
+        return rej(e);
+      }
+      q.push({ fn, res, rej });
+      pump();
+    });
+  run.stats = () => ({ active, queued: q.length });
+  return run;
+}
+const upstreamSlot = makeLimiter(Number(process.env.UPSTREAM_CONCURRENCY || 64));
+
+// كاش المقاطع المفكوكة في الذاكرة (LRU بحد أقصى للحجم) — أول طالب بيجيبها والباقي بياخدها من الرامات
+const SEG_CACHE_MAX = Number(process.env.SEGMENT_CACHE_MB || 160) * 1024 * 1024;
+const SEG_CACHE_TTL = 10 * 60_000;
+const PREFETCH_AHEAD = Number(process.env.PREFETCH_AHEAD || 2);
+const segCache = new Map(); // key -> { buf, exp } (ترتيب الإدخال = ترتيب الاستخدام)
+let segCacheBytes = 0;
+function segDel(k) {
+  const e = segCache.get(k);
+  if (e) {
+    segCacheBytes -= e.buf.length;
+    segCache.delete(k);
+  }
+}
+function segGet(k) {
+  const e = segCache.get(k);
+  if (!e) return null;
+  if (Date.now() > e.exp) {
+    segDel(k);
+    return null;
+  }
+  segCache.delete(k);
+  segCache.set(k, e);
+  return e.buf;
+}
+function segSet(k, buf) {
+  if (buf.length > SEG_CACHE_MAX / 4) return;
+  segDel(k);
+  segCache.set(k, { buf, exp: Date.now() + SEG_CACHE_TTL });
+  segCacheBytes += buf.length;
+  for (const kk of segCache.keys()) {
+    if (segCacheBytes <= SEG_CACHE_MAX) break;
+    segDel(kk);
+  }
+}
 
 // ═══════════════════════════════════════════════════════════
 // Rate limit — strict, no bypass via X-Forwarded-For spoof alone
@@ -42,8 +201,11 @@ function rateLimit(options = {}) {
   const scope = options.scope || "global";
   const banAfter = options.banAfter || 0; // consecutive 429s before short ban
   const banMs = options.banMs || 5 * 60_000;
+  const skip = options.skip;
+  const keyFn = options.keyFn;
   return (req, res, next) => {
-    const ip = clientIp(req);
+    if (skip && skip(req)) return next();
+    const ip = keyFn ? keyFn(req) : clientIp(req);
     const banKey = ip + ":ban:" + scope;
     const bannedUntil = banBuckets.get(banKey) || 0;
     if (bannedUntil > Date.now()) {
@@ -157,7 +319,9 @@ const CONFIG = {
     "api.coursatk.online",
     "stream-weave.com",
     "floravon.online",
-    "c-cdn.online"
+    "c-cdn.online",
+    "thanawica.com",
+    "www.thanawica.com"
   ],
   STREAM_ORIGIN: "https://coursatk.online",
   STREAM_REFERER: "https://coursatk.online/",
@@ -186,8 +350,12 @@ const CONFIG = {
   // Session TTL
   STUDENT_SESSION_MS: 7 * 24 * 3600 * 1000, // 7 days max (also capped by code expiry)
   ADMIN_SESSION_MS: 12 * 3600 * 1000, // 12h
-  STREAM_SESSION_MS: 15 * 60 * 1000,
+  STREAM_SESSION_MS: 15 * 60 * 1000, // (قديم) — بقى فيه STREAM_IDLE_MS / STREAM_MAX_MS
+  STREAM_IDLE_MS: 45 * 60 * 1000, // الجلسة بتنتهي بعد 45 دقيقة من آخر مقطع اتطلب (كانت 15 دقيقة ثابتة وبتقطع المحاضرات الطويلة)
+  STREAM_MAX_MS: 12 * 3600 * 1000,
   MAX_PROXY_BYTES: 12 * 1024 * 1024,
+  THANAWICA_CODE: process.env.THANAWICA_CODE || "", // أو من thanawica_code.txt
+  THANAWICA_ENABLED: process.env.THANAWICA_ENABLED !== "0",
   CODE_TYPES: {
     trial: { label: "تجربة", ms: 1 * 3600 * 1000 },
     month: { label: "شهر", ms: 30 * 24 * 3600 * 1000 },
@@ -511,18 +679,36 @@ async function fbGetCached(p, ttlMs = 20_000) {
   const key = "fb:" + p;
   const hit = cacheGet(key);
   if (hit !== null) return hit;
-  const val = await fbGet(p);
-  cacheSet(key, val, ttlMs);
-  return val;
+  return coalesce(key, async () => {
+    const val = await fbGet(p);
+    cacheSet(key, val, ttlMs);
+    return val;
+  });
+}
+
+// أي كتابة على Firebase بتمسح الكاش المرتبط بالمسار ده (عشان طرد جهاز/إيقاف طالب يتطبق بسرعة)
+const authCache = new Map(); // studentCode -> { student, exp }
+function fbInvalidate(p) {
+  const parts = String(p).split("/").filter(Boolean);
+  let acc = "";
+  for (const part of parts) {
+    acc += (acc ? "/" : "") + part;
+    memCache.delete("fb:" + acc);
+  }
+  cacheDel("fb:" + parts.join("/"));
+  if (parts[0] === "students") {
+    if (parts[1]) authCache.delete(parts[1]);
+    else authCache.clear();
+  }
 }
 
 async function fbGet(p) {
   const base = getFirebaseUrl();
   if (!base) throw new Error("Firebase غير مضبوط — أدخله من لوحة التحكم");
-  const r = await fetch(`${base}/${p}.json`, {
+  const r = await fetchT(`${base}/${p}.json`, {
     headers: { Accept: "application/json" },
     cache: "no-store"
-  });
+  }, { timeout: 12_000, retries: 1 });
   const text = await r.text();
   if (text.trim().startsWith("<")) {
     throw new Error(
@@ -545,12 +731,13 @@ async function fbGet(p) {
 async function fbSet(p, data) {
   const base = getFirebaseUrl();
   if (!base) throw new Error("Firebase غير مضبوط — أدخله من لوحة التحكم");
-  const r = await fetch(`${base}/${p}.json`, {
+  const r = await fetchT(`${base}/${p}.json`, {
     method: "PUT",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(data)
-  });
+  }, { timeout: 15_000, retries: 1 });
   const text = await r.text();
+  fbInvalidate(p);
   if (text.trim().startsWith("<")) {
     throw new Error(
       "قاعدة Realtime Database مش متإنشاءة أو الرابط غلط (المشروع الحالي فيه Firestore فقط — أنشئ Realtime Database)"
@@ -567,12 +754,13 @@ async function fbSet(p, data) {
 async function fbPatch(p, data) {
   const base = getFirebaseUrl();
   if (!base) throw new Error("Firebase غير مضبوط — أدخله من لوحة التحكم");
-  const r = await fetch(`${base}/${p}.json`, {
+  const r = await fetchT(`${base}/${p}.json`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(data)
-  });
+  }, { timeout: 15_000, retries: 1 });
   const text = await r.text();
+  fbInvalidate(p);
   if (text.trim().startsWith("<")) {
     throw new Error("Realtime Database مش جاهزة — أنشئها من Firebase Console");
   }
@@ -588,7 +776,8 @@ async function fbPatch(p, data) {
 async function fbDelete(p) {
   const base = getFirebaseUrl();
   if (!base) throw new Error("Firebase غير مضبوط — أدخله من لوحة التحكم");
-  const r = await fetch(`${base}/${p}.json`, { method: "DELETE" });
+  const r = await fetchT(`${base}/${p}.json`, { method: "DELETE" }, { timeout: 15_000, retries: 1 });
+  fbInvalidate(p);
   if (!r.ok) throw new Error(`Firebase DELETE ${p} → ${r.status}`);
   return true;
 }
@@ -645,6 +834,19 @@ function getBearer(req) {
 }
 
 // ── Student auth middleware ──
+// كان بيعمل 1-2 طلب Firebase مع كل request (حتى كل مقطع فيديو!) — دلوقتي كاش 15 ثانية + دمج الطلبات المتطابقة
+const AUTH_TTL_MS = 15_000;
+const badTokens = new Map(); // token -> exp (توكنات مش موجودة — بلاش نسأل Firebase عنها كل مرة)
+
+async function getStudentCached(code) {
+  const c = authCache.get(code);
+  const t = Date.now();
+  if (c && t < c.exp) return c.student;
+  const student = await coalesce("stu:" + code, () => fbGet(`students/${code}`));
+  authCache.set(code, { student, exp: Date.now() + AUTH_TTL_MS });
+  return student;
+}
+
 async function requireStudent(req, res, next) {
   try {
     const token = getBearer(req);
@@ -652,8 +854,13 @@ async function requireStudent(req, res, next) {
 
     let sess = studentSessions.get(token);
     if (!sess) {
-      const remote = await fbGet(`sessions/${token}`);
-      if (!remote) return jsonError(res, 401, "جلسة غير صالحة");
+      const bad = badTokens.get(token);
+      if (bad && bad > Date.now()) return jsonError(res, 401, "جلسة غير صالحة");
+      const remote = await coalesce("sess:" + token, () => fbGet(`sessions/${token}`));
+      if (!remote) {
+        badTokens.set(token, Date.now() + 20_000);
+        return jsonError(res, 401, "جلسة غير صالحة");
+      }
       sess = remote;
       studentSessions.set(token, sess);
     }
@@ -665,7 +872,7 @@ async function requireStudent(req, res, next) {
     }
 
     // Validate student still exists & active & not expired
-    const student = await fbGet(`students/${sess.code}`);
+    const student = await getStudentCached(String(sess.code));
     if (!student || student.active === false) {
       studentSessions.delete(token);
       return jsonError(res, 401, "الحساب غير موجود أو موقوف");
@@ -1022,11 +1229,12 @@ async function upstreamHeaders(extra = {}) {
   };
 }
 
-async function upstreamJson(apiPath, options = {}) {
-  const r = await fetch(`${CONFIG.COURSATK_API}${apiPath}`, {
-    ...options,
-    headers: await upstreamHeaders(options.headers || {})
-  });
+async function upstreamJsonRaw(apiPath, options = {}) {
+  const isGet = !options.method || String(options.method).toUpperCase() === "GET";
+  const headers = await upstreamHeaders(options.headers || {});
+  const r = await upstreamSlot(() =>
+    fetchT(`${CONFIG.COURSATK_API}${apiPath}`, { ...options, headers }, { timeout: 15_000, retries: isGet ? 1 : 0 })
+  );
   const text = await r.text();
   let data;
   try { data = JSON.parse(text); } catch {
@@ -1034,6 +1242,31 @@ async function upstreamJson(apiPath, options = {}) {
   }
   if (!r.ok) throw new Error(data?.message || `Upstream HTTP ${r.status}`);
   return data;
+}
+
+// الردود دي واحدة لكل الطلاب (توكن واحد) → نخزّنها ونجيبها مرة واحدة بس، ولو السيرفر الأصلي وقع نرجّع آخر نسخة
+const upCache = new Map(); // path -> { data, exp, stale }
+const UP_STALE_MS = 30 * 60_000;
+function upTtl(apiPath) {
+  return /\/lectures\/[^/]+\/content/.test(apiPath) ? 60_000 : 180_000;
+}
+async function upstreamJson(apiPath, options = {}) {
+  const isGet = !options.method || String(options.method).toUpperCase() === "GET";
+  if (!isGet) return upstreamJsonRaw(apiPath, options);
+  const hit = upCache.get(apiPath);
+  if (hit && Date.now() < hit.exp) return hit.data;
+  try {
+    const data = await coalesce("up:" + apiPath, () => upstreamJsonRaw(apiPath, options));
+    const t = Date.now();
+    upCache.set(apiPath, { data, exp: t + upTtl(apiPath), stale: t + UP_STALE_MS });
+    return data;
+  } catch (e) {
+    if (hit && Date.now() < hit.stale) {
+      console.warn("[upstream] served stale:", apiPath, e.message);
+      return hit.data;
+    }
+    throw e;
+  }
 }
 
 function allowedStreamUrl(raw, session = null) {
@@ -1072,14 +1305,33 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   for (const [k, v] of Object.entries(extra || {})) {
     if (v != null && v !== "") headers[k] = v;
   }
-  return fetch(url, { headers, cache: "no-store" });
+  const hasRange = Boolean(headers.Range || headers.range);
+  return upstreamSlot(() => fetchT(url, { headers, cache: "no-store" }, { timeout: 25_000, retries: hasRange ? 0 : 1 }));
 }
 
 // ═══════════════════════════════════════════════════════════
 // PUBLIC (no auth)
 // ═══════════════════════════════════════════════════════════
 // Global: soft only (prevents total abuse, won't block normal admin/import)
-app.use(rateLimit({ max: 300, windowMs: 60_000, scope: "global" }));
+// (حد الـ IP أعلى لأن شبكات الموبايل/المدارس بتشارك IP واحد بين مئات الطلاب)
+// مسارات البث مستثناة من الحد العام — ليها حد مستقل بالتوكن بدل الـ IP عشان مفيش طالب يتحظر بسبب زميله
+app.use(
+  rateLimit({
+    max: 1500,
+    windowMs: 60_000,
+    scope: "global",
+    skip: (req) => req.path.startsWith("/api/stream/") || req.path === "/health"
+  })
+);
+app.use(
+  "/api/stream/",
+  rateLimit({
+    max: 1500,
+    windowMs: 60_000,
+    scope: "stream",
+    keyFn: (req) => "t:" + (getBearer(req) || clientIp(req))
+  })
+);
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -1087,6 +1339,14 @@ app.get("/health", (_req, res) => {
     service: "coursatk-protected-api",
     cryptoReady: Boolean(decryptPlaybackKeyFn),
     decryptSegments: true,
+    version: APP_VERSION,
+    cache: {
+      segments: segCache.size,
+      segmentMB: Math.round(segCacheBytes / 1048576),
+      sources: sourceCache.size,
+      streamSessions: streamSessions.size,
+      upstream: upstreamSlot.stats()
+    },
     now: new Date().toISOString()
   });
 });
@@ -1410,9 +1670,53 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
       }
     }
 
-    const results = await Promise.all(wantedIds.map((sid, idx) =>
+    let results = await Promise.all(wantedIds.map((sid, idx) =>
       resolveOne(sid).then((s) => ({ ...s, order_index: idx + 1 }))
     ));
+
+    // Hybrid: replace chemistry/math with Thanawica subjects (same year), keep everything else from Coursatk
+    if (CONFIG.THANAWICA_ENABLED) {
+      try {
+        const thList = await thSubjectsForYear(yearId);
+        const thByKind = new Map(thList.map((s) => [s._kind, s]));
+        const filtered = [];
+        let replacedChem = false;
+        let replacedMath = false;
+        for (const s of results) {
+          const kind = chemMathKind(s.name);
+          if (kind && thByKind.has(kind)) {
+            if (kind === "chemistry" && replacedChem) continue;
+            if (kind === "math" && replacedMath) continue;
+            const th = thByKind.get(kind);
+            filtered.push({
+              ...th,
+              order_index: s.order_index,
+              name: th.name || s.name,
+              image_url: s.image_url || th.image_url || null
+            });
+            if (kind === "chemistry") replacedChem = true;
+            if (kind === "math") replacedMath = true;
+          } else if (!kind) {
+            filtered.push(s);
+          } else {
+            // chem/math name but no th mapping — keep original
+            filtered.push(s);
+          }
+        }
+        // if upstream had no chem/math names, still append Thanawica ones
+        for (const [kind, th] of thByKind) {
+          const has = filtered.some((x) => chemMathKind(x.name) === kind || x._kind === kind);
+          if (!has) filtered.push({ ...th, order_index: filtered.length + 1 });
+        }
+        results = filtered;
+        console.log("[subjects] hybrid thanawica chem/math injected", {
+          student: req.student.code,
+          th: results.filter((x) => x._source === "thanawica").map((x) => x.name)
+        });
+      } catch (e) {
+        console.warn("[subjects] thanawica hybrid skip:", e.message);
+      }
+    }
 
     res.json({
       success: true,
@@ -1426,6 +1730,10 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
 
 app.get("/api/subjects/:id/teachers", requireStudent, async (req, res) => {
   try {
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id)) {
+      const data = await thTeachers(req.params.id);
+      return res.json({ success: true, message: "Success", data });
+    }
     res.json(
       await upstreamJson(`/user/subjects/${encodeURIComponent(req.params.id)}/teachers`)
     );
@@ -1436,6 +1744,10 @@ app.get("/api/subjects/:id/teachers", requireStudent, async (req, res) => {
 
 app.get("/api/teachers/:id/chapters", requireStudent, async (req, res) => {
   try {
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id)) {
+      const data = await thChapters(req.params.id);
+      return res.json({ success: true, message: "Success", data });
+    }
     res.json(
       await upstreamJson(`/user/teachers/${encodeURIComponent(req.params.id)}/chapters`)
     );
@@ -1446,6 +1758,10 @@ app.get("/api/teachers/:id/chapters", requireStudent, async (req, res) => {
 
 app.get("/api/chapters/:id/lectures", requireStudent, async (req, res) => {
   try {
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id)) {
+      const data = await thLectures(req.params.id);
+      return res.json({ success: true, message: "Success", data });
+    }
     res.json(
       await upstreamJson(`/user/chapters/${encodeURIComponent(req.params.id)}/lectures`)
     );
@@ -1456,6 +1772,9 @@ app.get("/api/chapters/:id/lectures", requireStudent, async (req, res) => {
 
 app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
   try {
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id)) {
+      return res.json(await thLectureContent(req.params.id));
+    }
     res.json(
       await upstreamJson(`/user/lectures/${encodeURIComponent(req.params.id)}/content`)
     );
@@ -1466,152 +1785,44 @@ app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════
 // STREAM (student token) — decrypted segments
+// v1.1: مصدر الفيديو (play + playlist + مفتاح التشفير) بيتجهز مرة واحدة لكل فيديو ويتشارك بين كل الطلاب،
+//       والمقاطع المفكوكة بتتخزن في الرامات — 100 طالب على نفس الفيديو = طلب واحد للسيرفر الأصلي.
 // ═══════════════════════════════════════════════════════════
-app.post("/api/play/:videoId", requireStudent, async (req, res) => {
-  try {
-    const videoId = String(req.params.videoId);
-    const upstreamTok = await getCoursatkToken();
-    if (!upstreamTok) return jsonError(res, 503, "توكن كورساتك غير مضبوط");
+const SOURCE_TTL_MS = Number(process.env.SOURCE_TTL_MS || 8 * 60_000); // مدة إعادة استخدام المصدر لطلاب جدد
+const sourceCache = new Map(); // videoId -> { src, exp }
+const SID_TOKEN = "{{SID}}"; // مش موجود في base64url فمفيش تصادم
 
-    let mode = null;
-    let streamUrl = null;
-    let sessionToken = null;
-    let resolvedVideoId = videoId;
-    const errors = [];
+async function buildPlaylist(src, masterText, clientHeaders) {
+  if (masterText == null) {
+    const m = await streamFetch(src, src.streamUrl, {}, clientHeaders);
+    if (!m.ok) throw new Error(`Stream master HTTP ${m.status}`);
+    masterText = await m.text();
+  }
+  let text = masterText;
+  let baseUrl = src.streamUrl;
 
-    // CDN أولاً (2026) — لو فشل → Weave (2027 زي ما هو)
-    try {
-      const masterUrl = `${CONFIG.COURSATK_API}/video/stream/${encodeURIComponent(videoId)}/playlist.m3u8`;
-      const probe = await fetch(masterUrl, {
-        headers: {
-          Authorization: `Bearer ${upstreamTok}`,
-          Accept: "*/*",
-          Origin: CONFIG.STREAM_ORIGIN,
-          Referer: CONFIG.STREAM_REFERER,
-          "User-Agent": CONFIG.STREAM_UA
-        },
-        cache: "no-store"
-      });
-      if (!probe.ok) throw new Error(`CDN ${probe.status}`);
-      const masterText = await probe.text();
-      if (!masterText.includes("#EXTM3U")) throw new Error("CDN playlist غير صالح");
-      mode = "cdn";
-      streamUrl = masterUrl;
-      sessionToken = upstreamTok;
-    } catch (e) {
-      errors.push(e.message);
-    }
-
-    if (!mode) {
-      try {
-        const data = await upstreamJson(
-          `/video/${encodeURIComponent(videoId)}/stream-weave/play`,
-          { method: "POST", headers: { Accept: "application/json" } }
-        );
-        if (!data?.success || !data?.data?.token || !data?.data?.stream_url) {
-          throw new Error("Weave response ناقص");
-        }
-        mode = "weave";
-        sessionToken = data.data.token;
-        streamUrl = data.data.stream_url;
-        resolvedVideoId = String(data.data.video_id || videoId);
-      } catch (e) {
-        errors.push(e.message);
+  const mLines = masterText.split(/\r?\n/);
+  let variant = null;
+  for (let i = 0; i < mLines.length; i++) {
+    if (mLines[i].trim().startsWith("#EXT-X-STREAM-INF")) {
+      const next = mLines[i + 1]?.trim();
+      if (next && !next.startsWith("#")) {
+        variant = new URL(next, src.streamUrl).href;
+        break;
       }
     }
-
-    if (!mode || !streamUrl || !sessionToken) {
-      throw new Error(errors.join(" | ") || "مفيش منصة تشغيل");
-    }
-
-    const id = crypto.randomUUID();
-    const allowedHosts = new Set(CONFIG.STREAM_HOSTS);
-    try {
-      allowedHosts.add(new URL(streamUrl).hostname);
-    } catch {}
-
-    streamSessions.set(id, {
-      id,
-      videoId: resolvedVideoId,
-      token: sessionToken,
-      streamUrl,
-      mode,
-      createdAt: now(),
-      plainKey: null,
-      defaultIv: null,
-      allowedHosts,
-      ownerCode: req.session.code
-    });
-
-    res.json({
-      success: true,
-      data: {
-        session: id,
-        video_id: resolvedVideoId,
-        mode,
-        manifest_url: `/api/stream/manifest/${id}`
-      }
-    });
-  } catch (e) {
-    console.error("[play]", e.message);
-    jsonError(res, 502, e.message);
   }
-});
-
-function getStreamSession(id) {
-  const s = streamSessions.get(id);
-  if (!s) return null;
-  if (now() - s.createdAt > CONFIG.STREAM_SESSION_MS) {
-    streamSessions.delete(id);
-    return null;
-  }
-  return s;
-}
-
-app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
-  const session = getStreamSession(req.params.sessionId);
-  if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
-  if (session.ownerCode !== req.session.code) {
-    return jsonError(res, 403, "جلسة تشغيل ليست لك");
+  if (variant) {
+    const v = await streamFetch(src, variant, {}, clientHeaders);
+    if (!v.ok) throw new Error(`Variant HTTP ${v.status}`);
+    text = await v.text();
+    baseUrl = variant;
   }
 
-  try {
-    const master = await streamFetch(session, session.streamUrl, {}, req.headers);
-    if (!master.ok) throw new Error(`Stream master HTTP ${master.status}`);
-    const masterText = await master.text();
-    const lines = masterText.split(/\r?\n/);
-
-    let variant = null;
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].trim().startsWith("#EXT-X-STREAM-INF")) {
-        const next = lines[i + 1]?.trim();
-        if (next && !next.startsWith("#")) {
-          variant = new URL(next, session.streamUrl).href;
-          break;
-        }
-      }
-    }
-
-    if (variant) {
-      const variantRes = await streamFetch(session, variant, {}, req.headers);
-      if (!variantRes.ok) throw new Error(`Variant HTTP ${variantRes.status}`);
-      return rewritePlaylist(
-        req.params.sessionId, session, await variantRes.text(), variant, res, req.headers
-      );
-    }
-    return rewritePlaylist(
-      req.params.sessionId, session, masterText, session.streamUrl, res, req.headers
-    );
-  } catch (e) {
-    console.error("[manifest]", e.message);
-    jsonError(res, 502, e.message);
-  }
-});
-
-async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHeaders) {
-  try { session.allowedHosts.add(new URL(baseUrl).hostname); } catch {}
+  try { src.allowedHosts.add(new URL(baseUrl).hostname); } catch {}
   const lines = text.split(/\r?\n/);
   const out = [];
+  const segs = [];
   let mediaSeq = 0;
   let currentIv = null;
   let keyFetched = false;
@@ -1630,51 +1841,341 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
       if (ivHex) currentIv = parseIvHex(ivHex);
       if (uri && !keyFetched) {
         const keyUrl = new URL(uri, baseUrl).href;
-        try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
-        const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
+        try { src.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
+        const keyRes = await streamFetch(src, keyUrl, {}, clientHeaders);
         if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
         const wrapped = Buffer.from(await keyRes.arrayBuffer());
-        if (session.mode === "cdn" || (uri && String(uri).includes("/user/auth/"))) {
-          session.plainKey = await unwrapCdnKey(wrapped);
+        if (src.mode === "cdn" || String(uri).includes("/user/auth/")) {
+          src.plainKey = await unwrapCdnKey(wrapped);
         } else {
-          session.plainKey = await unwrapKey(wrapped, session.videoId);
+          src.plainKey = await unwrapKey(wrapped, src.videoId);
         }
-        session.defaultIv = currentIv;
+        src.defaultIv = currentIv;
         keyFetched = true;
-        console.log(`[key] ${session.mode || "weave"} for ${session.videoId}`);
+        console.log(`[key] ${src.mode || "weave"} for ${src.videoId}`);
       }
       continue; // strip KEY — segments are plain
     }
     if (line && !line.startsWith("#")) {
       const segmentUrl = new URL(line, baseUrl).href;
-      try { session.allowedHosts.add(new URL(segmentUrl).hostname); } catch {}
+      try { src.allowedHosts.add(new URL(segmentUrl).hostname); } catch {}
       const seq = mediaSeq + segIndex;
       const iv = currentIv || ivFromMediaSequence(seq);
-      const payload = Buffer.from(
-        JSON.stringify({ u: segmentUrl, iv: iv.toString("hex"), s: seq }),
-        "utf8"
-      ).toString("base64url");
-      out.push(`/api/stream/segment/${sessionId}/${payload}`);
+      const ivHex = iv.toString("hex");
+      const payload = Buffer.from(JSON.stringify({ u: segmentUrl, iv: ivHex, s: seq }), "utf8").toString("base64url");
+      out.push(`/api/stream/segment/${SID_TOKEN}/${payload}`);
+      segs.push({ u: segmentUrl, iv: ivHex, s: seq });
       segIndex++;
       continue;
     }
     out.push(raw);
   }
-  if (!session.plainKey) throw new Error("فشل تجهيز مفتاح التشفير");
+  if (!src.plainKey) throw new Error("فشل تجهيز مفتاح التشفير");
 
+  src.mediaSeq = mediaSeq;
+  src.segs = segs;
+  src.playlist = out.join("\n");
+}
+
+async function buildVideoSource(videoId, clientHeaders) {
+  const upstreamTok = await getCoursatkToken();
+  if (!upstreamTok) {
+    const e = new Error("توكن كورساتك غير مضبوط");
+    e.status = 503;
+    throw e;
+  }
+
+  let mode = null;
+  let streamUrl = null;
+  let sessionToken = null;
+  let resolvedVideoId = videoId;
+  let probeText = null;
+  const errors = [];
+
+  // CDN أولاً (2026) — لو فشل → Weave (2027 زي ما هو)
+  try {
+    const masterUrl = `${CONFIG.COURSATK_API}/video/stream/${encodeURIComponent(videoId)}/playlist.m3u8`;
+    const probe = await upstreamSlot(() =>
+      fetchT(
+        masterUrl,
+        {
+          headers: {
+            Authorization: `Bearer ${upstreamTok}`,
+            Accept: "*/*",
+            Origin: CONFIG.STREAM_ORIGIN,
+            Referer: CONFIG.STREAM_REFERER,
+            "User-Agent": CONFIG.STREAM_UA
+          },
+          cache: "no-store"
+        },
+        { timeout: 15_000, retries: 1 }
+      )
+    );
+    if (!probe.ok) throw new Error(`CDN ${probe.status}`);
+    const masterText = await probe.text();
+    if (!masterText.includes("#EXTM3U")) throw new Error("CDN playlist غير صالح");
+    mode = "cdn";
+    streamUrl = masterUrl;
+    sessionToken = upstreamTok;
+    probeText = masterText; // نفس الـ master اللي هنحتاجه — مفيش داعي نجيبه تاني
+  } catch (e) {
+    errors.push(e.message);
+  }
+
+  if (!mode) {
+    try {
+      const data = await upstreamJson(`/video/${encodeURIComponent(videoId)}/stream-weave/play`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      if (!data?.success || !data?.data?.token || !data?.data?.stream_url) {
+        throw new Error("Weave response ناقص");
+      }
+      mode = "weave";
+      sessionToken = data.data.token;
+      streamUrl = data.data.stream_url;
+      resolvedVideoId = String(data.data.video_id || videoId);
+    } catch (e) {
+      errors.push(e.message);
+    }
+  }
+
+  if (!mode || !streamUrl || !sessionToken) {
+    throw new Error(errors.join(" | ") || "مفيش منصة تشغيل");
+  }
+
+  const allowedHosts = new Set(CONFIG.STREAM_HOSTS);
+  try { allowedHosts.add(new URL(streamUrl).hostname); } catch {}
+
+  const src = {
+    reqVideoId: videoId,
+    videoId: resolvedVideoId,
+    mode,
+    token: sessionToken,
+    streamUrl,
+    allowedHosts,
+    plainKey: null,
+    defaultIv: null,
+    mediaSeq: 0,
+    segs: [],
+    playlist: "",
+    createdAt: now()
+  };
+  await buildPlaylist(src, probeText, clientHeaders);
+  return src;
+}
+
+// المصدر بيتجهز مرة واحدة حتى لو 100 طالب فتحوا نفس الفيديو في نفس اللحظة
+function getVideoSource(videoId, clientHeaders) {
+  const hit = sourceCache.get(videoId);
+  if (hit && now() < hit.exp) return Promise.resolve(hit.src);
+  return coalesce("src:" + videoId, async () => {
+    // Thanawica video ids: thp_<playlistHash> or thv_<pageVideoId>
+    if (CONFIG.THANAWICA_ENABLED && /^th[pv]_/.test(String(videoId))) {
+      let hash = null;
+      const raw = String(videoId);
+      if (raw.startsWith("thp_")) {
+        hash = raw.slice(4);
+      } else {
+        // thv_<pageVideoId> or thv_<hexHash>
+        const rest = raw.slice(4);
+        if (/^[a-f0-9]{16,}$/i.test(rest)) {
+          hash = rest;
+        } else if (/^\d+$/.test(rest)) {
+          // Resolve numeric video page id → playlist hash (optional ?lecture= or body)
+          // Clients may pass lecture via query; try common cache keys via thResolve
+          // lecture id is required for the video page URL — accept from clientHeaders? no.
+          // Fallback: error with clear message unless lectureId provided in videoId form thv_LEC_VID
+          // Support thv_<videoPageId> with lecture in query string on play route — handled below via global
+          const e = new Error("فيديو ثناويكا: افتح المحاضرة من جديد (الـ id لازم thp_hash)");
+          e.status = 400;
+          throw e;
+        } else {
+          const e = new Error("فيديو ثناويكا غير صالح");
+          e.status = 400;
+          throw e;
+        }
+      }
+      if (!hash) {
+        const e = new Error("فيديو ثناويكا يحتاج playlist hash");
+        e.status = 400;
+        throw e;
+      }
+      const src = await thGetVideoSource(hash, { sidToken: SID_TOKEN });
+      src.reqVideoId = videoId;
+      sourceCache.set(videoId, { src, exp: now() + SOURCE_TTL_MS });
+      return src;
+    }
+    const src = await buildVideoSource(videoId, clientHeaders);
+    sourceCache.set(videoId, { src, exp: now() + SOURCE_TTL_MS });
+    return src;
+  });
+}
+
+// لو المصدر انتهى عند السيرفر الأصلي (401/403) نجهّز واحد جديد ونحوّل الجلسة عليه من غير ما الطالب يحس
+async function refreshSource(session) {
+  try {
+    const id = session.src.reqVideoId;
+    const cur = sourceCache.get(id);
+    if (cur && cur.src !== session.src && now() < cur.exp) {
+      session.src = cur.src;
+      return cur.src;
+    }
+    sourceCache.delete(id);
+    const fresh = await getVideoSource(id, null);
+    if (fresh && fresh !== session.src) {
+      session.src = fresh;
+      return fresh;
+    }
+  } catch (e) {
+    console.warn("[source refresh]", e.message);
+  }
+  return null;
+}
+
+function getStreamSession(id, touch = true) {
+  const s = streamSessions.get(id);
+  if (!s) return null;
+  const t = now();
+  // انتهاء "منزلق": بيتجدد مع كل طلب مقطع، فالمحاضرات الطويلة مبتتقطعش
+  if (t - s.lastUsed > CONFIG.STREAM_IDLE_MS || t - s.createdAt > CONFIG.STREAM_MAX_MS) {
+    streamSessions.delete(id);
+    return null;
+  }
+  if (touch) s.lastUsed = t;
+  return s;
+}
+
+app.post("/api/play/:videoId", requireStudent, async (req, res) => {
+  try {
+    let videoId = String(req.params.videoId);
+    // Resolve thv_<numeric> using lectureId from body/query → playlist hash → thp_
+    if (CONFIG.THANAWICA_ENABLED && /^thv_\d+$/i.test(videoId)) {
+      const pageId = videoId.slice(4);
+      const lecRaw = req.body?.lectureId ?? req.query?.lectureId ?? req.body?.lecture ?? req.query?.lecture;
+      let lec = lecRaw != null ? Number(lecRaw) : null;
+      if (lec != null && lec >= 9_000_000) lec = lec - 9_000_000;
+      if (lec != null && Number.isFinite(lec) && lec > 0) {
+        try {
+          const hash = await thResolvePlaylistHash(lec, pageId);
+          videoId = "thp_" + hash;
+        } catch (e) {
+          return jsonError(res, 502, e.message || "تعذر جلب فيديو ثناويكا");
+        }
+      }
+    }
+    const src = await getVideoSource(videoId, req.headers);
+
+    const id = crypto.randomUUID();
+    streamSessions.set(id, {
+      id,
+      src,
+      videoId: src.videoId,
+      ownerCode: req.session.code,
+      createdAt: now(),
+      lastUsed: now()
+    });
+
+    res.json({
+      success: true,
+      data: {
+        session: id,
+        video_id: src.videoId,
+        mode: src.mode,
+        manifest_url: `/api/stream/manifest/${id}`
+      }
+    });
+  } catch (e) {
+    console.error("[play]", e.message);
+    jsonError(res, e.status || 502, e.message);
+  }
+});
+
+// الـ playlist جاهزة في الرامات — مفيش أي طلب للسيرفر الأصلي هنا
+app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
+  const session = getStreamSession(req.params.sessionId);
+  if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
+  if (session.ownerCode !== req.session.code) {
+    return jsonError(res, 403, "جلسة تشغيل ليست لك");
+  }
   res.set({
     "Content-Type": "application/vnd.apple.mpegurl",
     "Cache-Control": "no-store",
     "Access-Control-Allow-Origin": "*"
   });
-  res.send(out.join("\n"));
+  res.send(session.src.playlist.split(SID_TOKEN).join(session.id));
+});
+
+// يجيب المقطع المفكوك: من الرامات لو موجود، أو من السيرفر الأصلي مرة واحدة بس حتى لو 100 طالب طلبوه
+async function getSegmentPlain(session, meta, url, iv, headers) {
+  const key = url + "|" + (meta.iv || "");
+  const hit = segGet(key);
+  if (hit) return hit;
+  return coalesce("seg:" + key, async () => {
+    const hit2 = segGet(key);
+    if (hit2) return hit2;
+
+    // Thanawica path: mint token + fetch + WASM decrypt (210-byte pad)
+    if (session.src.mode === "thanawica" && typeof session.src._thDecrypt === "function") {
+      const encrypted = await thMintAndFetchSegment(meta);
+      if (encrypted.length > CONFIG.MAX_PROXY_BYTES) {
+        const e = new Error("المقطع كبير");
+        e.status = 413;
+        throw e;
+      }
+      const ivHex = meta.iv || (iv ? Buffer.from(iv).toString("hex") : null);
+      const plain = await session.src._thDecrypt(encrypted, ivHex);
+      segSet(key, plain);
+      return plain;
+    }
+
+    let up = await streamFetch(session.src, url, {}, headers);
+    if ((up.status === 401 || up.status === 403) && Number.isFinite(meta.s)) {
+      const fresh = await refreshSource(session);
+      const fu = fresh && fresh.segs[meta.s - fresh.mediaSeq];
+      if (fu) up = await streamFetch(fresh, fu.u, {}, headers);
+    }
+    if (!up.ok) throw new Error(`Segment HTTP ${up.status}`);
+
+    const encrypted = Buffer.from(await up.arrayBuffer());
+    if (encrypted.length > CONFIG.MAX_PROXY_BYTES) {
+      const e = new Error("المقطع كبير");
+      e.status = 413;
+      throw e;
+    }
+    let plain;
+    try {
+      plain = decryptSegment(encrypted, session.src.plainKey, iv);
+    } catch {
+      plain = encrypted;
+    }
+    segSet(key, plain);
+    return plain;
+  });
+}
+
+// تسخين المقاطع الجاية في الخلفية — الطالب (وزمايله) بيلاقوها جاهزة بدل ما يستنوا
+function prefetchAhead(session, meta, headers) {
+  if (!PREFETCH_AHEAD || !Number.isFinite(meta.s)) return;
+  if (upstreamSlot.stats().queued > 8) return; // السيرفر الأصلي مشغول — الأولوية للطلبات الحقيقية
+  const src = session.src;
+  const idx = meta.s - src.mediaSeq;
+  if (!(idx >= 0)) return;
+  for (let k = 1; k <= PREFETCH_AHEAD; k++) {
+    const sg = src.segs[idx + k];
+    if (!sg) break;
+    const key = sg.u + "|" + sg.iv;
+    if (segCache.has(key) || inflight.has("seg:" + key)) continue;
+    const iv = parseIvHex(sg.iv) || src.defaultIv || ivFromMediaSequence(sg.s);
+    getSegmentPlain(session, { s: sg.s, iv: sg.iv }, sg.u, iv, headers).catch(() => {});
+  }
 }
 
 app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, res) => {
   const session = getStreamSession(req.params.sessionId);
   if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
   if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
-  if (!session.plainKey) return jsonError(res, 404, "مفتاح غير متاح");
+  if (!session.src.plainKey) return jsonError(res, 404, "مفتاح غير متاح");
 
   let meta;
   try {
@@ -1683,25 +2184,31 @@ app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, r
     return jsonError(res, 400, "segment meta غير صالح");
   }
   const url = meta?.u;
-  if (!url || !allowedStreamUrl(url, session)) return jsonError(res, 403, "رابط غير مسموح");
+  // ثناويكا: الروابط من thanawica.com — اسمح حتى لو الـ host list ناقصة
+  const isTh = session.src?.mode === "thanawica";
+  if (!url || (!isTh && !allowedStreamUrl(url, session.src))) {
+    return jsonError(res, 403, "رابط غير مسموح");
+  }
+  if (isTh && url && !/thanawica\.com/i.test(String(url))) {
+    return jsonError(res, 403, "رابط غير مسموح");
+  }
 
-  const iv = parseIvHex(meta.iv) || session.defaultIv || ivFromMediaSequence(meta.s || 0);
+  const iv = parseIvHex(meta.iv) || session.src.defaultIv || ivFromMediaSequence(meta.s || 0);
   try {
-    const upstream = await streamFetch(session, url, {
-      Range: req.headers.range || undefined
-    }, req.headers);
-    if (!upstream.ok && upstream.status !== 206) {
-      throw new Error(`Segment HTTP ${upstream.status}`);
-    }
-    const encrypted = Buffer.from(await upstream.arrayBuffer());
-    if (encrypted.length > CONFIG.MAX_PROXY_BYTES) {
-      return jsonError(res, 413, "المقطع كبير");
-    }
     let plain;
-    try {
-      plain = decryptSegment(encrypted, session.plainKey, iv);
-    } catch {
-      plain = encrypted;
+    if (req.headers.range && !isTh) {
+      // طلبات الـ Range نادرة — بتروح مباشرة من غير كاش (زي السلوك القديم)
+      const upstream = await streamFetch(session.src, url, { Range: req.headers.range }, req.headers);
+      if (!upstream.ok && upstream.status !== 206) throw new Error(`Segment HTTP ${upstream.status}`);
+      const encrypted = Buffer.from(await upstream.arrayBuffer());
+      if (encrypted.length > CONFIG.MAX_PROXY_BYTES) return jsonError(res, 413, "المقطع كبير");
+      try {
+        plain = decryptSegment(encrypted, session.src.plainKey, iv);
+      } catch {
+        plain = encrypted;
+      }
+    } else {
+      plain = await getSegmentPlain(session, meta, url, iv, req.headers);
     }
     res.status(200);
     res.set({
@@ -1711,8 +2218,9 @@ app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, r
       "Access-Control-Allow-Origin": "*"
     });
     res.send(plain);
+    if (!req.headers.range) prefetchAhead(session, meta, req.headers);
   } catch (e) {
-    if (!res.headersSent) jsonError(res, 502, e.message);
+    if (!res.headersSent) jsonError(res, e.status || 502, e.message);
     else res.end();
   }
 });
@@ -3089,7 +3597,8 @@ app.get("/api/media/:code/:file", async (req, res) => {
 app.get("/", (_req, res) => {
   res.status(403).json({
     success: false,
-    message: "خطأ: يلزم مصادقة. الوصول المباشر غير مسموح."
+    message: "خطأ: يلزم مصادقة. الوصول المباشر غير مسموح.",
+    version: APP_VERSION
   });
 });
 
@@ -3098,6 +3607,17 @@ app.use((req, res) => {
     success: false,
     message: "خطأ: يلزم مصادقة أو المسار غير موجود.",
     path: req.path
+  });
+});
+
+// آخر خط دفاع: أي خطأ في أي route يرجع JSON بدل ما يوقع السيرفر
+app.use((err, req, res, _next) => {
+  console.error("[express error]", req.method, req.path, (err && err.message) || err);
+  if (res.headersSent) return res.end();
+  const status = (err && (err.status || err.statusCode)) || 500;
+  res.status(status >= 400 && status < 600 ? status : 500).json({
+    success: false,
+    message: status === 400 ? "طلب غير صالح" : "حصل خطأ في السيرفر — جرّب تاني"
   });
 });
 
@@ -3111,13 +3631,29 @@ setInterval(() => {
     if (s.expiresAt && t > s.expiresAt) adminSessions.delete(k);
   }
   for (const [k, s] of streamSessions) {
-    if (t - s.createdAt > CONFIG.STREAM_SESSION_MS) streamSessions.delete(k);
+    if (t - s.lastUsed > CONFIG.STREAM_IDLE_MS || t - s.createdAt > CONFIG.STREAM_MAX_MS) streamSessions.delete(k);
+  }
+  for (const [k, e] of sourceCache) if (t > e.exp + 60_000) sourceCache.delete(k);
+  for (const [k, e] of upCache) if (t > e.stale) upCache.delete(k);
+  for (const [k, e] of authCache) if (t > e.exp) authCache.delete(k);
+  for (const [k, exp] of badTokens) if (t > exp) badTokens.delete(k);
+  for (const k of [...segCache.keys()]) {
+    const e = segCache.get(k);
+    if (e && t > e.exp) segDel(k);
   }
 }, 60_000).unref();
 
 // Boot: hash bootstrap password properly + load crypto
 CONFIG.BOOTSTRAP_ADMIN.passwordHash = scryptHash(CONFIG.BOOTSTRAP_ADMIN.passwordPlain);
 await loadDecryptionUtils();
+try {
+  if (CONFIG.THANAWICA_ENABLED && CONFIG.THANAWICA_CODE) {
+    await thanawicaLogin(CONFIG.THANAWICA_CODE);
+    console.log("[API] Thanawica hybrid ON — chemistry/math from thanawica.com");
+  }
+} catch (e) {
+  console.warn("[API] Thanawica login skipped:", e.message);
+}
 
 // Load site packages/agents from Firebase if configured
 try {
@@ -3158,7 +3694,17 @@ try {
   console.warn("[API] section seed skip:", e.message);
 }
 
-app.listen(CONFIG.PORT, () => {
-  console.log(`[API] :${CONFIG.PORT} protected · segment-decrypt ON`);
+const server = app.listen(CONFIG.PORT, () => {
+  console.log(`[API ${APP_VERSION}] :${CONFIG.PORT} protected · segment-decrypt ON · segment-cache ${Math.round(SEG_CACHE_MAX / 1048576)}MB`);
   console.log(`[API] bootstrap admin ready (Hema)`);
+});
+// Railway/الـ proxy بيفضّل الاتصال مفتوح أطول من الـ default بتاع Node (5 ثواني) — ده كان بيسبب ECONNRESET متقطع
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+server.requestTimeout = 0;
+// إيقاف هادي عند الـ deploy
+process.on("SIGTERM", () => {
+  console.log("[API] SIGTERM — closing");
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 10_000).unref();
 });
