@@ -298,14 +298,32 @@ function isSaneId(id) {
   return Number.isFinite(n) && n >= 10 && n < 1_000_000;
 }
 
+/** خريطة اسم → صورة من alt + src media */
+function parseImageByName(flight) {
+  const map = new Map();
+  const re1 =
+    /alt":"([^"]{2,120})"[\s\S]{0,500}?src":"(https:\/\/thanawica\.com\/api\/media\/[^"]+)"/g;
+  const re2 =
+    /src":"(https:\/\/thanawica\.com\/api\/media\/[^"]+)"[\s\S]{0,500}?alt":"([^"]{2,120})"/g;
+  for (const m of flight.matchAll(re1)) {
+    map.set(m[1].trim(), m[2]);
+  }
+  for (const m of flight.matchAll(re2)) {
+    const name = m[2].trim();
+    if (!map.has(name)) map.set(name, m[1]);
+  }
+  return map;
+}
+
 /**
- * استخراج قائمة عناصر من صفحة RSC: article key + alt + href
+ * استخراج قائمة عناصر من صفحة RSC: article key + alt + href + صورة
  * patternPath مثال: "/teachers/" أو "/chapters/" أو "/lectures/"
  */
 function parseArticleList(flight, pathPrefix) {
   const out = [];
   const seen = new Set();
   const nameById = new Map();
+  const imgByName = parseImageByName(flight);
 
   // 1) article,"ID" ... alt":"NAME"
   const artRe = new RegExp(
@@ -328,7 +346,7 @@ function parseArticleList(flight, pathPrefix) {
     const id = Number(m[1]);
     if (!isSaneId(id) || seen.has(id)) continue;
     seen.add(id);
-    out.push({ id, name: nameById.get(id) || null });
+    out.push({ id, name: nameById.get(id) || null, image_url: null });
   }
 
   // 3) fallback: أي /prefix/ID في النص
@@ -338,25 +356,26 @@ function parseArticleList(flight, pathPrefix) {
       const id = Number(m[1]);
       if (!isSaneId(id) || seen.has(id)) continue;
       seen.add(id);
-      out.push({ id, name: nameById.get(id) || null });
+      out.push({ id, name: nameById.get(id) || null, image_url: null });
     }
   }
 
-  // املأ أسماء ناقصة من alt العام أو children قريب من الـ path
+  // أسماء + صور
   for (const row of out) {
-    if (row.name) continue;
-    if (nameById.has(row.id)) {
-      row.name = nameById.get(row.id);
-      continue;
+    if (!row.name && nameById.has(row.id)) row.name = nameById.get(row.id);
+    if (!row.name) {
+      const near = new RegExp(
+        pathPrefix.replace(/\//g, "\\/") +
+          row.id +
+          String.raw`[\s\S]{0,800}?alt":"([^"]{2,100})"`,
+        ""
+      );
+      const nm = flight.match(near);
+      if (nm) row.name = nm[1].trim();
     }
-    const near = new RegExp(
-      pathPrefix.replace(/\//g, "\\/") +
-        row.id +
-        String.raw`[\s\S]{0,800}?alt":"([^"]{2,100})"`,
-      ""
-    );
-    const nm = flight.match(near);
-    if (nm) row.name = nm[1].trim();
+    if (row.name && imgByName.has(row.name)) {
+      row.image_url = imgByName.get(row.name);
+    }
   }
 
   return out;
@@ -423,7 +442,8 @@ export async function thSubjectsForYear(yearId) {
   const hit = cget(ck);
   if (hit) return hit;
   const html = await getHtml(`/years/${yk}`);
-  const flight = extractFlight(html);
+  const flight = extractFlight(html) + "\n" + html;
+  const imgByName = parseImageByName(flight);
   const out = [];
   // article","154" ... alt":"كيمياء"
   const re = /article","(\d+)"[\s\S]{0,1500}?alt":"([^"]+)"/g;
@@ -436,7 +456,7 @@ export async function thSubjectsForYear(yearId) {
     out.push({
       id: encodeThId(id),
       name,
-      image_url: null,
+      image_url: imgByName.get(name) || null,
       year_id: yearId,
       is_published: true,
       _source: "thanawica",
@@ -451,6 +471,7 @@ export async function thSubjectsForYear(yearId) {
       {
         id: encodeThId(map.chemistry),
         name: "كيمياء",
+        image_url: imgByName.get("كيمياء") || null,
         year_id: yearId,
         is_published: true,
         _source: "thanawica",
@@ -460,6 +481,7 @@ export async function thSubjectsForYear(yearId) {
       {
         id: encodeThId(map.math),
         name: "الرياضيات",
+        image_url: imgByName.get("الرياضيات") || null,
         year_id: yearId,
         is_published: true,
         _source: "thanawica",
@@ -484,7 +506,7 @@ export async function thTeachers(subjectId) {
   const teachers = rows.map((r) => ({
     id: encodeThId(r.id),
     name: r.name || `مدرس ${r.id}`,
-    image_url: null,
+    image_url: r.image_url || null,
     subject_id: encodeThId(th),
     _source: "thanawica",
     _thId: r.id
@@ -533,20 +555,62 @@ export async function thLectures(chapterId) {
   return lectures;
 }
 
-/** Resolve playlist hash for a Thanawica video page id */
-export async function thResolvePlaylistHash(lectureId, videoPageId) {
+/**
+ * Resolve video source from a Thanawica video page.
+ * Returns { kind: "hls", hash } أو { kind: "mp4", id }
+ * (2027 غالبًا HLS مشفّر — 2026 وحديثًا MP4 موقّع على video.thanawica.com)
+ */
+export async function thResolveVideo(lectureId, videoPageId) {
   const lec = Number(lectureId);
   const vid = String(videoPageId);
-  const ck = `phash:${lec}:${vid}`;
+  const ck = `vsrc:${lec}:${vid}`;
   const hit = cget(ck);
   if (hit) return hit;
   await ensureLogin();
   const vhtml = await getHtml(`/lectures/${lec}/videos/${vid}`);
   const vf = extractFlight(vhtml) + "\n" + vhtml;
+
   const pm = vf.match(/\/api\/stream\/playlist\/([a-f0-9]{16,})/i);
-  if (!pm) throw new Error("مفيش playlist للفيديو ده على ثناويكا");
-  cset(ck, pm[1], 10 * 60_000);
-  return pm[1];
+  if (pm) {
+    const out = { kind: "hls", hash: pm[1] };
+    cset(ck, out, 10 * 60_000);
+    return out;
+  }
+
+  const vm = vf.match(/\/api\/videos\/([a-f0-9]{16,})/i);
+  if (vm) {
+    const out = { kind: "mp4", id: vm[1] };
+    cset(ck, out, 10 * 60_000);
+    return out;
+  }
+
+  throw new Error("مفيش مصدر فيديو للفيديو ده على ثناويكا");
+}
+
+/** توافق خلفي: يرجع hash الـ HLS فقط */
+export async function thResolvePlaylistHash(lectureId, videoPageId) {
+  const src = await thResolveVideo(lectureId, videoPageId);
+  if (src.kind === "hls") return src.hash;
+  throw new Error("الفيديو ده MP4 مش playlist — استخدم thResolveVideo");
+}
+
+/** يجيب رابط MP4 موقّع من /api/videos/{id} (redirect → video.thanawica.com) */
+export async function thResolveMp4Url(videoFileId) {
+  await ensureLogin();
+  const id = String(videoFileId).replace(/[^a-f0-9]/gi, "");
+  if (id.length < 16) throw new Error("معرّف فيديو ثناويكا غير صالح");
+  const res = await thFetch(`/api/videos/${id}`, {
+    headers: { Accept: "*/*", Referer: BASE + "/" }
+  });
+  if (res.status >= 300 && res.status < 400) {
+    const loc = res.headers.get("location");
+    if (!loc) throw new Error("ثناويكا رجّعت redirect من غير location");
+    return loc.startsWith("http") ? loc : BASE + loc;
+  }
+  if (res.ok) {
+    return BASE + `/api/videos/${id}`;
+  }
+  throw new Error(`فشل جلب رابط الفيديو من ثناويكا (HTTP ${res.status})`);
 }
 
 export async function thLectureContent(lectureId) {
@@ -574,15 +638,29 @@ export async function thLectureContent(lectureId) {
     }
   }
 
+  // أسماء الفيديوهات من h3 قبل رابط الفيديو: "شرح" / "حل الواجب"
+  const videoTitleById = new Map();
+  for (const m of flight.matchAll(
+    /\["\$","h3"[^\]]*\{[^}]*"children":"([^"]{1,120})"\}[\s\S]{0,1500}?\/lectures\/\d+\/videos\/(\d+)/g
+  )) {
+    const title = m[1].trim();
+    const vid = m[2];
+    if (title && !/مشاهدة|رجوع|تنزيل|فتح/.test(title)) videoTitleById.set(vid, title);
+  }
+
   const videos = [];
   const seen = new Set();
   for (const m of flight.matchAll(/\/lectures\/\d+\/videos\/(\d+)/g)) {
     const vid = m[1];
     if (seen.has(vid)) continue;
     seen.add(vid);
+    const vName =
+      videoTitleById.get(vid) ||
+      (lecName && !/^محاضرة \d+$/.test(lecName) ? lecName : `فيديو ${vid}`);
     videos.push({
       id: `thv_${vid}`,
-      name: lecName && !/^محاضرة \d+$/.test(lecName) ? lecName : `فيديو ${vid}`,
+      name: vName,
+      title: vName,
       type: "video",
       _source: "thanawica",
       _videoPageId: vid,
@@ -590,43 +668,114 @@ export async function thLectureContent(lectureId) {
     });
   }
 
-  // hashes already on lecture page (usually only first / shared)
+  // hashes / mp4 ids already on lecture page
   const pageHashes = [...flight.matchAll(/\/api\/stream\/playlist\/([a-f0-9]{16,})/gi)].map((m) => m[1]);
+  const pageMp4 = [...flight.matchAll(/\/api\/videos\/([a-f0-9]{16,})/gi)].map((m) => m[1]);
   if (pageHashes.length && videos.length === 1) {
     videos[0]._playlistHash = pageHashes[0];
-  } else if (pageHashes.length && videos.length && !videos[0]._playlistHash) {
-    videos[0]._playlistHash = pageHashes[0];
+    videos[0]._kind = "hls";
+  } else if (pageMp4.length && videos.length === 1) {
+    videos[0]._mp4Id = pageMp4[0];
+    videos[0]._kind = "mp4";
   }
 
-  // Resolve missing hashes for every video (critical for play)
+  // Resolve missing sources for every video (critical for play)
   for (let i = 0; i < videos.length; i++) {
     const v = videos[i];
-    if (v._playlistHash) continue;
+    if (v._playlistHash || v._mp4Id) continue;
     try {
-      v._playlistHash = await thResolvePlaylistHash(th, v._videoPageId);
+      const src = await thResolveVideo(th, v._videoPageId);
+      if (src.kind === "hls") {
+        v._playlistHash = src.hash;
+        v._kind = "hls";
+      } else if (src.kind === "mp4") {
+        v._mp4Id = src.id;
+        v._kind = "mp4";
+      }
     } catch (e) {
-      console.warn("[thanawica] hash resolve", v._videoPageId, e.message);
+      console.warn("[thanawica] video resolve", v._videoPageId, e.message);
     }
   }
 
-  // Prefer playable id = thp_<hash> so /api/play works without extra resolve
+  // Prefer playable ids: thp_<hash> (HLS) أو thm_<id> (MP4) — مت downstreamش الاسم الحقيقي
   for (const v of videos) {
     if (v._playlistHash) {
       v.id = `thp_${v._playlistHash}`;
-      if (!v.name || /^فيديو \d+$/.test(v.name)) v.name = lecName || "فيديو";
+    } else if (v._mp4Id) {
+      v.id = `thm_${v._mp4Id}`;
     }
+    if (!v.name || /^فيديو \d+$/.test(v.name) || /^محاضرة \d+$/.test(v.name)) {
+      v.name = (videoTitleById.get(v._videoPageId) || lecName || "فيديو");
+    }
+    v.title = v.name;
   }
 
-  // If no video links but a bare playlist hash exists
+  // If no video links but a bare playlist/mp4 exists
   if (!videos.length && pageHashes.length) {
     videos.push({
       id: `thp_${pageHashes[0]}`,
       name: lecName || "فيديو",
+      title: lecName || "فيديو",
       type: "video",
       _source: "thanawica",
+      _kind: "hls",
       _playlistHash: pageHashes[0],
       _lectureId: th
     });
+  } else if (!videos.length && pageMp4.length) {
+    videos.push({
+      id: `thm_${pageMp4[0]}`,
+      name: lecName || "فيديو",
+      title: lecName || "فيديو",
+      type: "video",
+      _source: "thanawica",
+      _kind: "mp4",
+      _mp4Id: pageMp4[0],
+      _lectureId: th
+    });
+  }
+
+  // ملفات PDF / ملازم — من h3 + رابط التحميل
+  const files = [];
+  const seenFile = new Set();
+  for (const m of flight.matchAll(
+    /"children":"([^"]{2,150})"[\s\S]{0,600}?href":"(\/api\/media\/files\/(?:download\/)?[a-f0-9]+\.pdf)"/gi
+  )) {
+    const name = m[1].trim();
+    let href = m[2];
+    if (/تنزيل الملف|فتح الملف|ملفات المحاضرة|مشاهدة|رجوع/.test(name)) continue;
+    const hash = (href.match(/([a-f0-9]{16,}\.pdf)/i) || [])[1];
+    if (!hash || seenFile.has(hash)) continue;
+    seenFile.add(hash);
+    const url = href.startsWith("http") ? href : BASE + href.replace(/\/download\//, "/");
+    // رابط مباشر للملف (عام على ثناويكا) + نسخة download
+    const direct = `${BASE}/api/media/files/${hash}`;
+    files.push({
+      id: `thf_${hash.replace(/\.pdf$/i, "")}`,
+      name,
+      title: name,
+      type: "pdf",
+      url: direct,
+      download_url: `${BASE}/api/media/files/download/${hash}`,
+      _source: "thanawica"
+    });
+  }
+  // fallback: أي PDF من غير عنوان
+  if (!files.length) {
+    for (const m of flight.matchAll(/\/api\/media\/files\/(?:download\/)?([a-f0-9]+\.pdf)/gi)) {
+      const hash = m[1];
+      if (seenFile.has(hash)) continue;
+      seenFile.add(hash);
+      files.push({
+        id: `thf_${hash.replace(/\.pdf$/i, "")}`,
+        name: hash,
+        title: hash,
+        type: "pdf",
+        url: `${BASE}/api/media/files/${hash}`,
+        download_url: `${BASE}/api/media/files/download/${hash}`,
+        _source: "thanawica"
+      });
+    }
   }
 
   return {
@@ -635,7 +784,7 @@ export async function thLectureContent(lectureId) {
       id: encodeThId(th),
       name: lecName,
       videos,
-      files: [],
+      files,
       _source: "thanawica"
     }
   };
