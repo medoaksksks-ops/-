@@ -25,8 +25,6 @@ import {
   thGetVideoSource,
   thMintAndFetchSegment,
   thResolvePlaylistHash,
-  thResolveVideo,
-  thResolveMp4Url,
   isChemOrMathName,
   chemMathKind,
   isThId,
@@ -38,6 +36,8 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
+const MEDIA_DIR = path.join(DATA_DIR, "media");
+try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
 const APP_VERSION = "v1.1";
 
 // ═══════════════════════════════════════════════════════════
@@ -72,7 +72,7 @@ app.use(express.json({ limit: "20mb" }));
 app.use(
   compression({
     // مقاطع الفيديو مش بتتضغط — بلاش نصرف CPU عليها
-    filter: (req, res) => (req.path.startsWith("/api/stream/segment/") ? false : compression.filter(req, res))
+    filter: (req, res) => (req.path.startsWith("/api/hls/") || req.path.startsWith("/api/stream/segment/") ? false : compression.filter(req, res))
   })
 );
 
@@ -321,8 +321,7 @@ const CONFIG = {
     "floravon.online",
     "c-cdn.online",
     "thanawica.com",
-    "www.thanawica.com",
-    "video.thanawica.com"
+    "www.thanawica.com"
   ],
   STREAM_ORIGIN: "https://coursatk.online",
   STREAM_REFERER: "https://coursatk.online/",
@@ -331,7 +330,7 @@ const CONFIG = {
     "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/153.0.0.0 Mobile Safari/537.36",
   PLAYER_JS: "https://player.stream-weave.com/assets/player.js?v=1.1.1",
   // Firebase Realtime Database (NOT Firestore)
-  FIREBASE: "https://english-73376-default-rtdb.firebaseio.com",
+  FIREBASE: "https://dr-gamal-357a2-default-rtdb.firebaseio.com",
   // Bootstrap admin (always valid even if Firebase empty)
   BOOTSTRAP_ADMIN: {
     username: "Hema",
@@ -374,7 +373,7 @@ const CONFIG = {
 const RUNTIME_PATH = path.join(__dirname, "data", "runtime.json");
 
 const runtime = {
-  firebaseUrl: (process.env.FIREBASE_URL || "https://english-73376-default-rtdb.firebaseio.com").replace(/\/$/, ""),
+  firebaseUrl: (process.env.FIREBASE_URL || "https://dr-gamal-357a2-default-rtdb.firebaseio.com").replace(/\/$/, ""),
   coursatkToken: process.env.COURSATK_TOKEN || "",
   siteName: "كورساتك",
   packages: [
@@ -426,13 +425,12 @@ function getFirebaseUrl() {
     runtime.firebaseUrl ||
     process.env.FIREBASE_URL ||
     CONFIG.FIREBASE ||
-    "https://english-73376-default-rtdb.firebaseio.com"
+    "https://dr-gamal-357a2-default-rtdb.firebaseio.com"
   ).replace(/\/$/, "");
 }
 
 function getCoursatkTokenSync() {
-  // Railway env أولاً عشان ما يتسحش لو اللوحة حفظت فاضي
-  return process.env.COURSATK_TOKEN || runtime.coursatkToken || CONFIG.COURSATK_TOKEN || "";
+  return runtime.coursatkToken || process.env.COURSATK_TOKEN || CONFIG.COURSATK_TOKEN || "";
 }
 
 loadRuntimeFile();
@@ -665,8 +663,8 @@ function randomToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString("base64url");
 }
 
-function randomCode7() {
-  // 1000000 – 9999999 (7 أرقام)
+function randomCode9() {
+  // 1000000 – 9999999
   return String(Math.floor(1000000 + Math.random() * 9000000));
 }
 
@@ -797,10 +795,9 @@ async function getStorageBucket() {
 }
 
 function getCoursatkToken() {
-  // Railway env أولاً، بعدين runtime/Firebase
-  if (process.env.COURSATK_TOKEN) return process.env.COURSATK_TOKEN;
+  // priority: runtime file → env (Firebase async load happens separately)
   if (runtime.coursatkToken) return runtime.coursatkToken;
-  return CONFIG.COURSATK_TOKEN || "";
+  return process.env.COURSATK_TOKEN || CONFIG.COURSATK_TOKEN || "";
 }
 
 async function refreshCoursatkTokenFromFb() {
@@ -1323,11 +1320,20 @@ app.use(
     max: 1500,
     windowMs: 60_000,
     scope: "global",
-    skip: (req) => req.path.startsWith("/api/stream/") || req.path === "/health"
+    skip: (req) => req.path.startsWith("/api/stream/") || req.path.startsWith("/api/hls/") || req.path === "/health"
   })
 );
 app.use(
   "/api/stream/",
+  rateLimit({
+    max: 1500,
+    windowMs: 60_000,
+    scope: "stream",
+    keyFn: (req) => "t:" + (getBearer(req) || clientIp(req))
+  })
+);
+app.use(
+  "/api/hls/",
   rateLimit({
     max: 1500,
     windowMs: 60_000,
@@ -1416,8 +1422,8 @@ app.post("/api/auth/login", rateLimit({ max: 30, windowMs: 60_000, scope: "stude
     const deviceName = String(req.body?.deviceName || "Unknown").slice(0, 80);
     const ip = clientIp(req);
 
-    if (!/^\d{7}$/.test(code)) {
-      return jsonError(res, 400, "الكود يجب أن يكون 7 أرقام");
+    if (!/^\d{9}$/.test(code)) {
+      return jsonError(res, 400, "الكود يجب أن يكون 9 أرقام");
     }
     if (!deviceId || deviceId.length < 8) {
       return jsonError(res, 400, "deviceId مطلوب");
@@ -1706,9 +1712,8 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
             filtered.push(s);
           }
         }
-        // لو كورساتك مفيش كيميا/رياضة بالاسم، ضيف نسخ ثناويكا بس (مش باقي مواد ثناويكا)
+        // if upstream had no chem/math names, still append Thanawica ones
         for (const [kind, th] of thByKind) {
-          if (kind !== "chemistry" && kind !== "math") continue;
           const has = filtered.some((x) => chemMathKind(x.name) === kind || x._kind === kind);
           if (!has) filtered.push({ ...th, order_index: filtered.length + 1 });
         }
@@ -1866,9 +1871,9 @@ async function buildPlaylist(src, masterText, clientHeaders) {
       const seq = mediaSeq + segIndex;
       const iv = currentIv || ivFromMediaSequence(seq);
       const ivHex = iv.toString("hex");
-      const payload = Buffer.from(JSON.stringify({ u: segmentUrl, iv: ivHex, s: seq }), "utf8").toString("base64url");
-      out.push(`/api/stream/segment/${SID_TOKEN}/${payload}`);
-      segs.push({ u: segmentUrl, iv: ivHex, s: seq });
+      // مسار معتم: رقم المقطع فقط — مفيش روابط أبلستريم ولا base64 ظاهر للعميل
+      out.push(`/api/hls/${SID_TOKEN}/seg/${segIndex}`);
+      segs.push({ u: segmentUrl, iv: ivHex, s: seq, i: segIndex });
       segIndex++;
       continue;
     }
@@ -1974,33 +1979,11 @@ function getVideoSource(videoId, clientHeaders) {
   const hit = sourceCache.get(videoId);
   if (hit && now() < hit.exp) return Promise.resolve(hit.src);
   return coalesce("src:" + videoId, async () => {
-    // Thanawica: thp_<hlsHash> | thm_<mp4Id> | thv_<pageVideoId>
-    if (CONFIG.THANAWICA_ENABLED && /^th[pvm]_/i.test(String(videoId))) {
-      const raw = String(videoId);
-
-      // MP4 progressive (video.thanawica.com)
-      if (/^thm_/i.test(raw)) {
-        const mp4Id = raw.slice(4);
-        const signedUrl = await thResolveMp4Url(mp4Id);
-        const src = {
-          mode: "thanawica_mp4",
-          videoId: mp4Id,
-          reqVideoId: videoId,
-          plainKey: Buffer.from("thanawica_mp4"),
-          mp4Url: signedUrl,
-          mp4Id,
-          allowedHosts: new Set(["thanawica.com", "www.thanawica.com", "video.thanawica.com"]),
-          streamUrl: signedUrl,
-          playlist: null,
-          segs: [],
-          mediaSeq: 0
-        };
-        sourceCache.set(videoId, { src, exp: now() + Math.min(SOURCE_TTL_MS, 10 * 60_000) });
-        return src;
-      }
-
+    // Thanawica video ids: thp_<playlistHash> or thv_<pageVideoId>
+    if (CONFIG.THANAWICA_ENABLED && /^th[pv]_/.test(String(videoId))) {
       let hash = null;
-      if (/^thp_/i.test(raw)) {
+      const raw = String(videoId);
+      if (raw.startsWith("thp_")) {
         hash = raw.slice(4);
       } else {
         // thv_<pageVideoId> or thv_<hexHash>
@@ -2008,7 +1991,12 @@ function getVideoSource(videoId, clientHeaders) {
         if (/^[a-f0-9]{16,}$/i.test(rest)) {
           hash = rest;
         } else if (/^\d+$/.test(rest)) {
-          const e = new Error("فيديو ثناويكا: افتح المحاضرة من جديد (الـ id لازم thp_hash أو thm_id)");
+          // Resolve numeric video page id → playlist hash (optional ?lecture= or body)
+          // Clients may pass lecture via query; try common cache keys via thResolve
+          // lecture id is required for the video page URL — accept from clientHeaders? no.
+          // Fallback: error with clear message unless lectureId provided in videoId form thv_LEC_VID
+          // Support thv_<videoPageId> with lecture in query string on play route — handled below via global
+          const e = new Error("فيديو ثناويكا: افتح المحاضرة من جديد (الـ id لازم thp_hash)");
           e.status = 400;
           throw e;
         } else {
@@ -2070,7 +2058,7 @@ function getStreamSession(id, touch = true) {
 app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   try {
     let videoId = String(req.params.videoId);
-    // Resolve thv_<numeric> using lectureId → thp_ (HLS) أو thm_ (MP4)
+    // Resolve thv_<numeric> using lectureId from body/query → playlist hash → thp_
     if (CONFIG.THANAWICA_ENABLED && /^thv_\d+$/i.test(videoId)) {
       const pageId = videoId.slice(4);
       const lecRaw = req.body?.lectureId ?? req.query?.lectureId ?? req.body?.lecture ?? req.query?.lecture;
@@ -2078,9 +2066,8 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
       if (lec != null && lec >= 9_000_000) lec = lec - 9_000_000;
       if (lec != null && Number.isFinite(lec) && lec > 0) {
         try {
-          const resolved = await thResolveVideo(lec, pageId);
-          if (resolved.kind === "mp4") videoId = "thm_" + resolved.id;
-          else videoId = "thp_" + resolved.hash;
+          const hash = await thResolvePlaylistHash(lec, pageId);
+          videoId = "thp_" + hash;
         } catch (e) {
           return jsonError(res, 502, e.message || "تعذر جلب فيديو ثناويكا");
         }
@@ -2088,212 +2075,85 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
     }
     const src = await getVideoSource(videoId, req.headers);
 
-    const id = crypto.randomUUID();
+    // معرف تشغيل معتم — مش بيكشف أي حاجة عن الحساب أو المصدر
+    const id = crypto.randomUUID().replace(/-/g, "");
     streamSessions.set(id, {
       id,
       src,
       videoId: src.videoId,
       ownerCode: req.session.code,
+      ownerToken: req.sessionToken, // لربط الطلبات بنفس الجلسة
       createdAt: now(),
       lastUsed: now()
     });
 
-    const data = {
-      session: id,
-      video_id: src.videoId,
-      mode: src.mode
-    };
-    if (src.mode === "thanawica_mp4") {
-      // MP4 progressive — العميل يشغّل play_url (proxy مع Range)
-      data.play_url = `/api/stream/file/${id}`;
-      data.content_type = "video/mp4";
-    } else {
-      data.manifest_url = `/api/stream/manifest/${id}`;
-    }
-
-    res.json({ success: true, data });
+    // العميل بيشوف رابط تشغيل واحد بس — مفيش sessionId ولا mode ولا توكن في الـ URL
+    res.json({
+      success: true,
+      data: {
+        play_url: `/api/hls/${id}/master.m3u8`
+      }
+    });
   } catch (e) {
     console.error("[play]", e.message);
     jsonError(res, e.status || 502, e.message);
   }
 });
 
-/** Proxy MP4 progressive من video.thanawica.com (مع دعم Range للسيك) */
-app.get("/api/stream/file/:sessionId", requireStudent, async (req, res) => {
-  try {
-    const session = getStreamSession(req.params.sessionId);
-    if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
-    if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
-    if (session.src?.mode !== "thanawica_mp4") return jsonError(res, 400, "مش فيديو MP4");
-
-    let url = session.src.mp4Url;
-    // جدّد التوقيع لو قرّب يخلص (الـ exp في الـ query)
-    try {
-      const u = new URL(url);
-      const exp = Number(u.searchParams.get("exp") || 0);
-      if (exp && exp * 1000 < Date.now() + 60_000) {
-        url = await thResolveMp4Url(session.src.mp4Id);
-        session.src.mp4Url = url;
-      }
-    } catch {}
-
-    const headers = {
-      "User-Agent": CONFIG.STREAM_UA,
-      Accept: "*/*",
-      Referer: "https://thanawica.com/",
-      Origin: "https://thanawica.com"
-    };
-    if (req.headers.range) headers.Range = req.headers.range;
-
-    const up = await fetchT(url, { headers, redirect: "follow" }, { timeout: 60_000, retries: 1 });
-    if (!up.ok && up.status !== 206) {
-      // جرب تجديد الرابط مرة
-      try {
-        url = await thResolveMp4Url(session.src.mp4Id);
-        session.src.mp4Url = url;
-        const up2 = await fetchT(url, { headers, redirect: "follow" }, { timeout: 60_000, retries: 0 });
-        if (!up2.ok && up2.status !== 206) return jsonError(res, up2.status, `فيديو HTTP ${up2.status}`);
-        res.status(up2.status);
-        const ct = up2.headers.get("content-type") || "video/mp4";
-        res.setHeader("Content-Type", ct);
-        const cr = up2.headers.get("content-range");
-        if (cr) res.setHeader("Content-Range", cr);
-        const cl = up2.headers.get("content-length");
-        if (cl) res.setHeader("Content-Length", cl);
-        res.setHeader("Accept-Ranges", "bytes");
-        res.setHeader("Cache-Control", "private, no-store");
-        res.setHeader("Access-Control-Allow-Origin", "*");
-        const buf = Buffer.from(await up2.arrayBuffer());
-        return res.send(buf);
-      } catch (e) {
-        return jsonError(res, 502, e.message);
-      }
-    }
-
-    res.status(up.status);
-    res.setHeader("Content-Type", up.headers.get("content-type") || "video/mp4");
-    const cr = up.headers.get("content-range");
-    if (cr) res.setHeader("Content-Range", cr);
-    const cl = up.headers.get("content-length");
-    if (cl) res.setHeader("Content-Length", cl);
-    res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Cache-Control", "private, no-store");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    const buf = Buffer.from(await up.arrayBuffer());
-    res.send(buf);
-  } catch (e) {
-    if (!res.headersSent) jsonError(res, e.status || 502, e.message);
-    else res.end();
-  }
-});
-
-// الـ playlist جاهزة في الرامات — مفيش أي طلب للسيرفر الأصلي هنا
-app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
-  const session = getStreamSession(req.params.sessionId);
-  if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
+/**
+ * HLS master — لازم توكن حساب الطالب (header أو query)
+ * المسار معتم: مفيش بيانات أبلستريم ظاهرة
+ */
+app.get("/api/hls/:pid/master.m3u8", requireStudent, async (req, res) => {
+  const session = getStreamSession(req.params.pid);
+  if (!session) return jsonError(res, 404, "انتهت صلاحية التشغيل");
   if (session.ownerCode !== req.session.code) {
-    return jsonError(res, 403, "جلسة تشغيل ليست لك");
+    return jsonError(res, 403, "غير مصرح");
   }
+  // استبدال الـ placeholder بالمعرّف الحقيقي
+  const body = session.src.playlist.split(SID_TOKEN).join(session.id);
   res.set({
     "Content-Type": "application/vnd.apple.mpegurl",
     "Cache-Control": "no-store",
     "Access-Control-Allow-Origin": "*"
   });
-  res.send(session.src.playlist.split(SID_TOKEN).join(session.id));
+  res.send(body);
 });
 
-// يجيب المقطع المفكوك: من الرامات لو موجود، أو من السيرفر الأصلي مرة واحدة بس حتى لو 100 طالب طلبوه
-async function getSegmentPlain(session, meta, url, iv, headers) {
-  const key = url + "|" + (meta.iv || "");
-  const hit = segGet(key);
-  if (hit) return hit;
-  return coalesce("seg:" + key, async () => {
-    const hit2 = segGet(key);
-    if (hit2) return hit2;
-
-    // Thanawica path: mint token + fetch + WASM decrypt (210-byte pad)
-    if (session.src.mode === "thanawica" && typeof session.src._thDecrypt === "function") {
-      const encrypted = await thMintAndFetchSegment(meta);
-      if (encrypted.length > CONFIG.MAX_PROXY_BYTES) {
-        const e = new Error("المقطع كبير");
-        e.status = 413;
-        throw e;
-      }
-      const ivHex = meta.iv || (iv ? Buffer.from(iv).toString("hex") : null);
-      const plain = await session.src._thDecrypt(encrypted, ivHex);
-      segSet(key, plain);
-      return plain;
-    }
-
-    let up = await streamFetch(session.src, url, {}, headers);
-    if ((up.status === 401 || up.status === 403) && Number.isFinite(meta.s)) {
-      const fresh = await refreshSource(session);
-      const fu = fresh && fresh.segs[meta.s - fresh.mediaSeq];
-      if (fu) up = await streamFetch(fresh, fu.u, {}, headers);
-    }
-    if (!up.ok) throw new Error(`Segment HTTP ${up.status}`);
-
-    const encrypted = Buffer.from(await up.arrayBuffer());
-    if (encrypted.length > CONFIG.MAX_PROXY_BYTES) {
-      const e = new Error("المقطع كبير");
-      e.status = 413;
-      throw e;
-    }
-    let plain;
-    try {
-      plain = decryptSegment(encrypted, session.src.plainKey, iv);
-    } catch {
-      plain = encrypted;
-    }
-    segSet(key, plain);
-    return plain;
-  });
-}
-
-// تسخين المقاطع الجاية في الخلفية — الطالب (وزمايله) بيلاقوها جاهزة بدل ما يستنوا
-function prefetchAhead(session, meta, headers) {
-  if (!PREFETCH_AHEAD || !Number.isFinite(meta.s)) return;
-  if (upstreamSlot.stats().queued > 8) return; // السيرفر الأصلي مشغول — الأولوية للطلبات الحقيقية
-  const src = session.src;
-  const idx = meta.s - src.mediaSeq;
-  if (!(idx >= 0)) return;
-  for (let k = 1; k <= PREFETCH_AHEAD; k++) {
-    const sg = src.segs[idx + k];
-    if (!sg) break;
-    const key = sg.u + "|" + sg.iv;
-    if (segCache.has(key) || inflight.has("seg:" + key)) continue;
-    const iv = parseIvHex(sg.iv) || src.defaultIv || ivFromMediaSequence(sg.s);
-    getSegmentPlain(session, { s: sg.s, iv: sg.iv }, sg.u, iv, headers).catch(() => {});
+/**
+ * مقطع فيديو بالمؤشر فقط — السيرفر بيجيب الرابط الحقيقي من الذاكرة وبيفك التشفير
+ * مفيش base64 فيه روابط thanawica/coursatk
+ */
+app.get("/api/hls/:pid/seg/:idx", requireStudent, async (req, res) => {
+  const session = getStreamSession(req.params.pid);
+  if (!session) return jsonError(res, 404, "انتهت صلاحية التشغيل");
+  if (session.ownerCode !== req.session.code) return jsonError(res, 403, "غير مصرح");
+  if (!session.src.plainKey && session.src.mode !== "thanawica") {
+    return jsonError(res, 404, "غير متاح");
   }
-}
 
-app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, res) => {
-  const session = getStreamSession(req.params.sessionId);
-  if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
-  if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
-  if (!session.src.plainKey) return jsonError(res, 404, "مفتاح غير متاح");
+  const idx = Number(req.params.idx);
+  if (!Number.isFinite(idx) || idx < 0) return jsonError(res, 400, "طلب غير صالح");
 
-  let meta;
-  try {
-    meta = JSON.parse(Buffer.from(req.params.encoded, "base64url").toString("utf8"));
-  } catch {
-    return jsonError(res, 400, "segment meta غير صالح");
-  }
-  const url = meta?.u;
-  // ثناويكا: الروابط من thanawica.com — اسمح حتى لو الـ host list ناقصة
+  const segs = session.src.segs || [];
+  const sg = segs[idx];
+  if (!sg) return jsonError(res, 404, "المقطع غير موجود");
+
+  const url = sg.u;
   const isTh = session.src?.mode === "thanawica";
   if (!url || (!isTh && !allowedStreamUrl(url, session.src))) {
-    return jsonError(res, 403, "رابط غير مسموح");
+    return jsonError(res, 403, "غير مصرح");
   }
   if (isTh && url && !/thanawica\.com/i.test(String(url))) {
-    return jsonError(res, 403, "رابط غير مسموح");
+    return jsonError(res, 403, "غير مصرح");
   }
 
-  const iv = parseIvHex(meta.iv) || session.src.defaultIv || ivFromMediaSequence(meta.s || 0);
+  const meta = { u: url, iv: sg.iv, s: sg.s };
+  const iv = parseIvHex(sg.iv) || session.src.defaultIv || ivFromMediaSequence(sg.s || 0);
+
   try {
     let plain;
     if (req.headers.range && !isTh) {
-      // طلبات الـ Range نادرة — بتروح مباشرة من غير كاش (زي السلوك القديم)
       const upstream = await streamFetch(session.src, url, { Range: req.headers.range }, req.headers);
       if (!upstream.ok && upstream.status !== 206) throw new Error(`Segment HTTP ${upstream.status}`);
       const encrypted = Buffer.from(await upstream.arrayBuffer());
@@ -2319,6 +2179,14 @@ app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, r
     if (!res.headersSent) jsonError(res, e.status || 502, e.message);
     else res.end();
   }
+});
+
+// ── مسارات قديمة (مقفولة) — عشان محدش يستخدم الشكل اللي بيفضح البيانات ──
+app.get("/api/stream/manifest/:sessionId", (_req, res) => {
+  return jsonError(res, 410, "المسار لم يعد متاحًا");
+});
+app.get("/api/stream/segment/:sessionId/:encoded", (_req, res) => {
+  return jsonError(res, 410, "المسار لم يعد متاحًا");
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -2573,12 +2441,12 @@ app.post("/api/admin/students/import", requireAdmin("students_create"), async (r
       try {
         // Accept English or Arabic column names (لوحة التحكم)
         let code = String(row.code || row["الكود"] || "").replace(/\D/g, "");
-        if (code.length > 7) code = code.slice(-7);
-        if (!/^\d{7}$/.test(code)) {
+        if (code.length < 7) {
           failed++;
-          errors.push({ code: row.code || row["الكود"], error: "الكود يجب 7 أرقام" });
+          errors.push({ code: row.code || row["الكود"], error: "كود غير صالح" });
           continue;
         }
+        if (code.length < 9) code = code.padStart(9, "0");
 
         const name = String(row.name || row["الاسم"] || "بدون اسم").trim().slice(0, 120);
         const sectionRaw = row.section || row["الشعبة"] || "";
@@ -2682,12 +2550,12 @@ app.post("/api/admin/students", requireAdmin("students_create"), async (req, res
     }
 
     if (code) {
-      if (!/^\d{7}$/.test(code)) return jsonError(res, 400, "الكود يجب 7 أرقام");
+      if (!/^\d{9}$/.test(code)) return jsonError(res, 400, "الكود يجب 9 أرقام");
       const exists = await fbGet(`students/${code}`);
       if (exists) return jsonError(res, 409, "الكود مستخدم بالفعل");
     } else {
       for (let i = 0; i < 30; i++) {
-        code = randomCode7();
+        code = randomCode9();
         const exists = await fbGet(`students/${code}`);
         if (!exists) break;
       }
@@ -2805,45 +2673,6 @@ app.delete("/api/admin/students/:code", requireAdmin("students_delete"), async (
     }
     await fbDelete(`students/${code}`);
     res.json({ success: true });
-  } catch (e) {
-    jsonError(res, 500, e.message);
-  }
-});
-
-/**
- * تنظيف قاعدة البيانات: مسح كل الأكواد + جلسات الطلاب
- * الشعب (sections) والأدمن والإعدادات بتفضل زي ما هي
- * body: { confirm: "PURGE" }
- */
-app.post("/api/admin/database/purge", requireAdmin("students_delete"), async (req, res) => {
-  try {
-    if (String(req.body?.confirm || "").trim() !== "PURGE") {
-      return jsonError(res, 400, 'للتأكيد ابعت confirm: "PURGE"');
-    }
-
-    const students = (await fbGet("students")) || {};
-    const sessions = (await fbGet("sessions")) || {};
-    const studentCount = Object.keys(students).length;
-    const sessionCount = Object.keys(sessions).length;
-
-    // مسح جماعي من Firebase (العقدة كلها) — أسرع من حذف واحد واحد
-    await fbDelete("students");
-    await fbDelete("sessions");
-
-    // تنظيف الكاش في الذاكرة
-    studentSessions.clear();
-    authCache.clear();
-    badTokens.clear();
-
-    res.json({
-      success: true,
-      message: "تم تنظيف قاعدة البيانات (الأكواد والجلسات) — الشعب محفوظة",
-      data: {
-        deletedStudents: studentCount,
-        deletedSessions: sessionCount,
-        kept: ["sections", "admins", "config", "sales"]
-      }
-    });
   } catch (e) {
     jsonError(res, 500, e.message);
   }
@@ -3221,6 +3050,509 @@ app.delete("/api/admin/admins/:id", requireAdmin("admins_manage"), async (req, r
 });
 
 
+// ═══════════════════════════════════════════════════════════
+
+/** ── Guest contact (no login) ──
+ * Client generates guestId (uuid) and stores in localStorage.
+ * Threads live under messages/guest_{guestId}
+ */
+function guestThreadKey(guestId) {
+  const id = String(guestId || "").replace(/[^a-zA-Z0-9_\-]/g, "").slice(0, 64);
+  if (id.length < 8) return null;
+  return "guest_" + id;
+}
+
+/** Public: send message to admin without login */
+app.post("/api/public/contact", rateLimit({ max: 12, windowMs: 60_000, scope: "public-contact" }), async (req, res) => {
+  try {
+    const guestId = String(req.body?.guestId || "").trim();
+    const key = guestThreadKey(guestId);
+    if (!key) return jsonError(res, 400, "guestId مطلوب (8 أحرف على الأقل)");
+
+    const name = String(req.body?.name || "زائر").trim().slice(0, 80) || "زائر";
+    const phone = String(req.body?.phone || "").trim().slice(0, 30);
+    const text = String(req.body?.text || "").trim().slice(0, 2000);
+
+    const id = makeMsgId();
+    let mediaMeta = null;
+    if (req.body?.media) {
+      try {
+        mediaMeta = saveMediaFile(key, id, req.body.media);
+      } catch (e) {
+        return jsonError(res, 400, e.message);
+      }
+    }
+    if (!text && !mediaMeta) return jsonError(res, 400, "اكتب رسالة أو أرسل صورة/تسجيل");
+
+    const msg = {
+      from: "guest",
+      type: mediaMeta ? mediaMeta.kind : "text",
+      text: text || (mediaMeta?.kind === "image" ? "📷 صورة" : mediaMeta?.kind === "audio" ? "🎤 رسالة صوتية" : ""),
+      name,
+      phone: phone || null,
+      ownerCode: key,
+      guest: true,
+      createdAt: now(),
+      read: false
+    };
+    if (mediaMeta) {
+      msg.mediaUrl = mediaMeta.url;
+      msg.mime = mediaMeta.mime;
+      msg.size = mediaMeta.size;
+      msg.fileName = mediaMeta.fileName;
+      msg.storage = mediaMeta.storage || "local";
+      if (mediaMeta.duration) msg.duration = mediaMeta.duration;
+    }
+
+    await fbSet(`messages/${key}/messages/${id}`, msg);
+    const cur = (await fbGet(`messages/${key}`)) || {};
+    await fbPatch(`messages/${key}`, {
+      updatedAt: now(),
+      studentName: name,
+      section: "guest",
+      ownerCode: key,
+      guest: true,
+      phone: phone || cur.phone || null,
+      unreadAdmin: Number(cur.unreadAdmin || 0) + 1,
+      unreadStudent: 0
+    });
+
+    res.json({
+      success: true,
+      data: { id, guestId, threadKey: key, ...msg }
+    });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** Public: fetch my guest thread (replies from admin) */
+app.get("/api/public/contact/:guestId", rateLimit({ max: 40, windowMs: 60_000, scope: "public-contact-get" }), async (req, res) => {
+  try {
+    const key = guestThreadKey(req.params.guestId);
+    if (!key) return jsonError(res, 400, "guestId غير صالح");
+    const thread = (await fbGet(`messages/${key}`)) || { messages: {} };
+    const list = Object.entries(thread.messages || {})
+      .map(([id, m]) => ({ id, ...m }))
+      .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+    // mark guest read
+    try { await fbPatch(`messages/${key}`, { unreadStudent: 0 }); } catch {}
+    res.json({
+      success: true,
+      data: {
+        guestId: String(req.params.guestId),
+        threadKey: key,
+        name: thread.studentName || "زائر",
+        messages: list,
+        unread: Number(thread.unreadStudent || 0)
+      }
+    });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+
+// Messaging — student <-> admin (stored in Firebase)
+// ═══════════════════════════════════════════════════════════
+
+function makeMsgId() {
+  return "m_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
+}
+
+function studentCode(req) {
+  const c = String(req.student?.code || req.session?.code || "").trim();
+  if (!/^\d{7,12}$/.test(c)) return null;
+  return c;
+}
+
+const MEDIA_MAX_BYTES = 12 * 1024 * 1024; // 12MB
+const MEDIA_ALLOWED = {
+  image: new Set(["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"]),
+  audio: new Set(["audio/webm", "audio/ogg", "audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav", "audio/aac", "audio/mp3"])
+};
+
+function detectMediaKind(mime) {
+  const m = String(mime || "").toLowerCase().split(";")[0].trim();
+  if (MEDIA_ALLOWED.image.has(m) || m.startsWith("image/")) return "image";
+  if (MEDIA_ALLOWED.audio.has(m) || m.startsWith("audio/")) return "audio";
+  return null;
+}
+
+function extFromMime(mime) {
+  const m = String(mime || "").toLowerCase().split(";")[0].trim();
+  const map = {
+    "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
+    "image/webp": "webp", "image/gif": "gif",
+    "audio/webm": "webm", "audio/ogg": "ogg", "audio/mpeg": "mp3",
+    "audio/mp3": "mp3", "audio/mp4": "m4a", "audio/wav": "wav",
+    "audio/x-wav": "wav", "audio/aac": "aac"
+  };
+  return map[m] || "bin";
+}
+
+/** Save media on Railway disk: data/media/{code}/{file} */
+function saveMediaFile(code, msgId, media) {
+  if (!media) return null;
+  let mime = String(media.mime || media.type || "").toLowerCase();
+  let b64 = media.data || media.base64 || "";
+  if (typeof b64 !== "string" || !b64) return null;
+
+  const dataUrl = b64.match(/^data:([^;]+);base64,(.+)$/i);
+  if (dataUrl) {
+    mime = dataUrl[1].toLowerCase();
+    b64 = dataUrl[2];
+  }
+  b64 = b64.replace(/\s/g, "");
+  const kind = detectMediaKind(mime);
+  if (!kind) throw new Error("نوع الملف غير مدعوم (صور: jpg/png/webp — صوت: webm/ogg/mp3/wav)");
+
+  let buf;
+  try {
+    buf = Buffer.from(b64, "base64");
+  } catch {
+    throw new Error("بيانات الملف غير صالحة");
+  }
+  if (!buf.length) throw new Error("الملف فاضي");
+  if (buf.length > MEDIA_MAX_BYTES) throw new Error("حجم الملف كبير (الحد 12 ميجا)");
+
+  const mimeClean = mime.split(";")[0].trim();
+  const dir = path.join(typeof MEDIA_DIR !== 'undefined' ? MEDIA_DIR : path.join(__dirname, 'data', 'media'), String(code));
+  fs.mkdirSync(dir, { recursive: true });
+  const fileName = `${msgId}.${extFromMime(mimeClean)}`;
+  const full = path.join(dir, fileName);
+  fs.writeFileSync(full, buf);
+
+  return {
+    kind,
+    mime: mimeClean,
+    size: buf.length,
+    fileName,
+    url: `/api/media/${encodeURIComponent(code)}/${encodeURIComponent(fileName)}`,
+    storage: "local",
+    duration: media.duration != null ? Number(media.duration) : null
+  };
+}
+
+function deleteMediaFile(code, fileName) {
+  if (!code || !fileName) return;
+  const safe = path.basename(String(fileName));
+  const full = path.join(MEDIA_DIR, String(code), safe);
+  try { if (fs.existsSync(full)) fs.unlinkSync(full); } catch {}
+}
+
+
+
+
+
+/** Student: list ONLY my messages */
+app.get("/api/messages", requireStudent, async (req, res) => {
+  try {
+    const code = studentCode(req);
+    if (!code) return jsonError(res, 401, "كود الجلسة غير صالح");
+    const thread = (await fbGet(`messages/${code}`)) || { messages: {}, updatedAt: 0 };
+    // ignore any thread that was mis-keyed
+    const list = Object.entries(thread.messages || {})
+      .map(([id, m]) => ({ id, ...m }))
+      .filter((m) => !m.ownerCode || m.ownerCode === code)
+      .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+    res.json({
+      success: true,
+      data: {
+        code,
+        messages: list,
+        unreadStudent: Number(thread.unreadStudent || 0),
+        unreadAdmin: Number(thread.unreadAdmin || 0)
+      }
+    });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** Student: send text / image / voice note
+ * body: { text?, media?: { mime, data: base64|dataURL, duration? } }
+ */
+app.post("/api/messages", requireStudent, rateLimit({ max: 60, windowMs: 60_000, scope: "msg-student" }), async (req, res) => {
+  try {
+    const text = String(req.body?.text || "").trim().slice(0, 2000);
+    const code = studentCode(req);
+    if (!code) return jsonError(res, 401, "كود الجلسة غير صالح");
+    const id = makeMsgId();
+
+    let mediaMeta = null;
+    if (req.body?.media) {
+      try {
+        mediaMeta = saveMediaFile(code, id, req.body.media);
+      } catch (e) {
+        return jsonError(res, 400, e.message);
+      }
+    }
+    if (!text && !mediaMeta) return jsonError(res, 400, "اكتب رسالة أو أرسل صورة/تسجيل");
+
+    const msg = {
+      from: "student",
+      type: mediaMeta ? mediaMeta.kind : "text",
+      text: text || (mediaMeta?.kind === "image" ? "📷 صورة" : mediaMeta?.kind === "audio" ? "🎤 رسالة صوتية" : ""),
+      name: req.student.name || code,
+      ownerCode: code,
+      createdAt: now(),
+      read: false
+    };
+    if (mediaMeta) {
+      msg.mediaUrl = mediaMeta.url;
+      msg.mime = mediaMeta.mime;
+      msg.size = mediaMeta.size;
+      msg.fileName = mediaMeta.fileName;
+      msg.storage = mediaMeta.storage || "firebase";
+      if (mediaMeta.objectPath) msg.objectPath = mediaMeta.objectPath;
+      if (mediaMeta.duration) msg.duration = mediaMeta.duration;
+    }
+
+    await fbSet(`messages/${code}/messages/${id}`, msg);
+    const cur = (await fbGet(`messages/${code}`)) || {};
+    await fbPatch(`messages/${code}`, {
+      updatedAt: now(),
+      studentName: req.student.name || code,
+      section: req.student.section || null,
+      ownerCode: code,
+      unreadAdmin: Number(cur.unreadAdmin || 0) + 1,
+      unreadStudent: 0
+    });
+    res.json({ success: true, data: { id, ...msg } });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** Student: mark thread as read */
+app.post("/api/messages/read", requireStudent, async (req, res) => {
+  try {
+    const code = studentCode(req);
+    if (!code) return jsonError(res, 401, "كود الجلسة غير صالح");
+    await fbPatch(`messages/${code}`, { unreadStudent: 0 });
+    res.json({ success: true });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** Student: delete one of my messages */
+app.delete("/api/messages/:msgId", requireStudent, async (req, res) => {
+  try {
+    const code = studentCode(req);
+    if (!code) return jsonError(res, 401, "كود الجلسة غير صالح");
+    const msgId = String(req.params.msgId);
+    const msg = await fbGet(`messages/${code}/messages/${msgId}`);
+    if (!msg) return jsonError(res, 404, "الرسالة غير موجودة");
+    if (msg.fileName) deleteMediaFile(code, msg.fileName);
+    await fbDelete(`messages/${code}/messages/${msgId}`);
+    res.json({ success: true, message: "تم حذف الرسالة" });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** Student: clear entire my thread */
+app.delete("/api/messages", requireStudent, async (req, res) => {
+  try {
+    const code = studentCode(req);
+    if (!code) return jsonError(res, 401, "كود الجلسة غير صالح");
+    await fbDelete(`messages/${code}`);
+    res.json({ success: true, message: "تم مسح المحادثة" });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** Admin: list all conversation threads */
+app.get("/api/admin/messages", requireAdmin("students_view"), async (_req, res) => {
+  try {
+    const all = (await fbGet("messages")) || {};
+    const threads = Object.entries(all)
+      .filter(([code]) => {
+        if (!code || code === "undefined") return false;
+        if (/^\d{7,12}$/.test(String(code))) return true;
+        if (String(code).startsWith("guest_")) return true;
+        return false;
+      })
+      .map(([code, t]) => {
+      const msgs = Object.values(t.messages || {});
+      const last = msgs.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
+      return {
+        code,
+        studentName: t.studentName || code,
+        section: t.section || null,
+        updatedAt: t.updatedAt || last?.createdAt || 0,
+        unreadAdmin: Number(t.unreadAdmin || 0),
+        lastMessage: last ? { text: last.text, type: last.type || 'text', from: last.from, createdAt: last.createdAt, mediaUrl: last.mediaUrl || null } : null,
+        count: msgs.length
+      };
+    }).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    res.json({ success: true, data: threads });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** Admin: get one thread */
+app.get("/api/admin/messages/:code", requireAdmin("students_view"), async (req, res) => {
+  try {
+    const code = String(req.params.code);
+    const thread = (await fbGet(`messages/${code}`)) || { messages: {} };
+    const list = Object.entries(thread.messages || {})
+      .map(([id, m]) => ({ id, ...m }))
+      .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+    // mark admin read
+    await fbPatch(`messages/${code}`, { unreadAdmin: 0 });
+    res.json({
+      success: true,
+      data: {
+        code,
+        studentName: thread.studentName || code,
+        messages: list
+      }
+    });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** Admin: reply (text / image / voice)
+ * body: { text?, media?: { mime, data, duration? } }
+ */
+app.post("/api/admin/messages/:code", requireAdmin("students_view"), rateLimit({ max: 120, windowMs: 60_000, scope: "msg-admin" }), async (req, res) => {
+  try {
+    // طالب: كود رقمي — زائر: guest_xxx (لازم نحافظ عليه، متتشالش منه الحروف)
+    const rawCode = String(req.params.code || "");
+    const code = rawCode.startsWith("guest_")
+      ? guestThreadKey(rawCode.slice(6))
+      : rawCode.replace(/\D/g, "");
+    if (!code) return jsonError(res, 400, "كود غير صالح");
+    const text = String(req.body?.text || "").trim().slice(0, 2000);
+    const id = makeMsgId();
+    let mediaMeta = null;
+    if (req.body?.media) {
+      try {
+        mediaMeta = saveMediaFile(code, id, req.body.media);
+      } catch (e) {
+        return jsonError(res, 400, e.message);
+      }
+    }
+    if (!text && !mediaMeta) return jsonError(res, 400, "اكتب رد أو أرسل صورة/تسجيل");
+    const msg = {
+      from: "admin",
+      type: mediaMeta ? mediaMeta.kind : "text",
+      text: text || (mediaMeta?.kind === "image" ? "📷 صورة" : mediaMeta?.kind === "audio" ? "🎤 رسالة صوتية" : ""),
+      name: req.admin.username || "أدمن",
+      ownerCode: code,
+      createdAt: now(),
+      read: false
+    };
+    if (mediaMeta) {
+      msg.mediaUrl = mediaMeta.url;
+      msg.mime = mediaMeta.mime;
+      msg.size = mediaMeta.size;
+      msg.fileName = mediaMeta.fileName;
+      msg.storage = mediaMeta.storage || "firebase";
+      if (mediaMeta.objectPath) msg.objectPath = mediaMeta.objectPath;
+      if (mediaMeta.duration) msg.duration = mediaMeta.duration;
+    }
+    await fbSet(`messages/${code}/messages/${id}`, msg);
+    const cur = (await fbGet(`messages/${code}`)) || {};
+    await fbPatch(`messages/${code}`, {
+      updatedAt: now(),
+      unreadStudent: Number(cur.unreadStudent || 0) + 1,
+      unreadAdmin: 0,
+      studentName: cur.studentName || code
+    });
+    res.json({ success: true, data: { id, ...msg } });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+
+
+/** Admin: delete one message in a thread */
+app.delete("/api/admin/messages/:code/:msgId", requireAdmin("students_view"), async (req, res) => {
+  try {
+    const code = String(req.params.code).trim();
+    const msgId = String(req.params.msgId);
+    const msg = await fbGet(`messages/${code}/messages/${msgId}`);
+    if (msg?.fileName) deleteMediaFile(code, msg.fileName);
+    await fbDelete(`messages/${code}/messages/${msgId}`);
+    res.json({ success: true, message: "تم حذف الرسالة" });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** Admin: delete whole thread */
+app.delete("/api/admin/messages/:code", requireAdmin("students_view"), async (req, res) => {
+  try {
+    const code = String(req.params.code).trim();
+    await fbDelete(`messages/${code}`);
+    res.json({ success: true, message: "تم حذف المحادثة" });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+
+/** Serve chat media (image/audio) — student owns thread OR admin */
+app.get("/api/media/:code/:file", async (req, res) => {
+  try {
+    let code = String(req.params.code || "");
+    // numeric student code OR guest_xxx thread folder
+    if (code.startsWith("guest_")) {
+      code = code.replace(/[^a-zA-Z0-9_\-]/g, "");
+    } else {
+      code = code.replace(/\D/g, "");
+    }
+    const file = path.basename(String(req.params.file || ""));
+    if (!code || !file || file.includes("..")) return jsonError(res, 400, "طلب غير صالح");
+
+    const token = getBearer(req) || String(req.query.token || "").trim();
+    const isGuestPath = code.startsWith("guest_");
+
+    // Guest media: allow if query guestId matches folder (public contact thread)
+    let allowed = false;
+    if (isGuestPath) {
+      const gid = String(req.query.guestId || "").replace(/[^a-zA-Z0-9_\-]/g, "");
+      if (gid && ("guest_" + gid) === code) allowed = true;
+    }
+    if (token) {
+      const stu = studentSessions.get(token);
+      if (stu && String(stu.code) === code) allowed = true;
+      if (!allowed && adminSessions.get(token)) allowed = true;
+      if (!allowed) {
+        try {
+          const remote = await fbGet(`sessions/${token}`);
+          if (remote && String(remote.code) === code) allowed = true;
+        } catch {}
+      }
+    }
+    if (!allowed) return jsonError(res, 403, "غير مصرح");
+
+    const full = path.join(MEDIA_DIR, code, file);
+    if (!fs.existsSync(full)) return jsonError(res, 404, "الملف غير موجود");
+
+    const ext = path.extname(file).toLowerCase();
+    const mimeMap = {
+      ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+      ".webp": "image/webp", ".gif": "image/gif",
+      ".webm": "audio/webm", ".ogg": "audio/ogg", ".mp3": "audio/mpeg",
+      ".m4a": "audio/mp4", ".wav": "audio/wav", ".aac": "audio/aac"
+    };
+    res.setHeader("Content-Type", mimeMap[ext] || "application/octet-stream");
+    res.setHeader("Cache-Control", "private, max-age=86400");
+    res.setHeader("Content-Disposition", `inline; filename="${file}"`);
+    fs.createReadStream(full).pipe(res);
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
 
 // ═══════════════════════════════════════════════════════════
 // Fallback
