@@ -315,29 +315,75 @@ function parseImageByName(flight) {
   return map;
 }
 
+/** "ساعة و35 دقيقة" / "45 دقيقة" / "ساعتين" → ثواني */
+function parseArabicDuration(str) {
+  const s = String(str || "");
+  let sec = 0;
+  if (/ساعتين/.test(s)) sec += 2 * 3600;
+  else if (/ساعات/.test(s)) {
+    const h = s.match(/(\d+)\s*ساعات/);
+    sec += h ? Number(h[1]) * 3600 : 0;
+  } else if (/ساعة/.test(s)) {
+    const h = s.match(/(\d+)\s*ساعة/);
+    sec += h ? Number(h[1]) * 3600 : 3600;
+  }
+  const m = s.match(/(\d+)\s*دق/);
+  if (m) sec += Number(m[1]) * 60;
+  return sec > 0 ? sec : null;
+}
+
 /**
- * استخراج قائمة عناصر من صفحة RSC: article key + alt + href + صورة
- * patternPath مثال: "/teachers/" أو "/chapters/" أو "/lectures/"
+ * استخراج قائمة من صفحة RSC: article + alt + href + صورة + عدد
+ * countHints: مثل ["فصول"] أو ["محاضرات"]
  */
-function parseArticleList(flight, pathPrefix) {
+function parseArticleList(flight, pathPrefix, countHints = []) {
   const out = [];
   const seen = new Set();
   const nameById = new Map();
+  const imgById = new Map();
+  const countById = new Map();
   const imgByName = parseImageByName(flight);
 
-  // 1) article,"ID" ... alt":"NAME"
-  const artRe = new RegExp(
-    String.raw`\["\$","article","(\d+)"[\s\S]{0,3500}?alt":"([^"]{2,120})"`,
-    "g"
-  );
-  for (const m of flight.matchAll(artRe)) {
-    const id = Number(m[1]);
+  // فك كل article لوحده (أدق للصور والعدد)
+  const parts = String(flight).split(/\["\$","article","(\d+)"/);
+  for (let i = 1; i < parts.length; i += 2) {
+    const id = Number(parts[i]);
     if (!isSaneId(id)) continue;
-    const name = m[2].trim();
-    if (name) nameById.set(id, name);
+    const block = parts[i + 1] || "";
+    const alt = block.match(/alt":"([^"]{2,120})"/);
+    if (alt) nameById.set(id, alt[1].trim());
+    const img = block.match(/src":"(https:\/\/thanawica\.com\/api\/media\/[^"]+)"/);
+    if (img) imgById.set(id, img[1]);
+    for (const hint of countHints) {
+      // children":[10," فصول"]
+      const m1 = block.match(new RegExp(String.raw`children":\[(\d+),"[^"]*` + hint));
+      if (m1) {
+        countById.set(id, Number(m1[1]));
+        break;
+      }
+      // "children":"عدد المحاضرات" ... "children":8
+      const m2 = block.match(
+        new RegExp(
+          String.raw`children":"[^"]*` +
+            hint +
+            String.raw`"[\s\S]{0,300}?"children":(\d+)`
+        )
+      );
+      if (m2) {
+        countById.set(id, Number(m2[1]));
+        break;
+      }
+      // نص: ...محاضرات... children":8
+      const m3 = block.match(
+        new RegExp(hint + String.raw`[\s\S]{0,300}?"children":(\d+)`)
+      );
+      if (m3) {
+        countById.set(id, Number(m3[1]));
+        break;
+      }
+    }
   }
 
-  // 2) href":"/prefix/ID"
   const hrefRe = new RegExp(
     String.raw`href":"` + pathPrefix.replace(/\//g, "\\/") + String.raw`(\d+)"`,
     "g"
@@ -346,36 +392,32 @@ function parseArticleList(flight, pathPrefix) {
     const id = Number(m[1]);
     if (!isSaneId(id) || seen.has(id)) continue;
     seen.add(id);
-    out.push({ id, name: nameById.get(id) || null, image_url: null });
+    out.push({ id, name: nameById.get(id) || null, image_url: null, count: null });
   }
 
-  // 3) fallback: أي /prefix/ID في النص
   if (!out.length) {
     const loose = new RegExp(pathPrefix.replace(/\//g, "\\/") + String.raw`(\d+)`, "g");
     for (const m of flight.matchAll(loose)) {
       const id = Number(m[1]);
       if (!isSaneId(id) || seen.has(id)) continue;
       seen.add(id);
-      out.push({ id, name: nameById.get(id) || null, image_url: null });
+      out.push({ id, name: nameById.get(id) || null, image_url: null, count: null });
     }
   }
 
-  // أسماء + صور
+  // article keys اللي ليها اسم/عدد حتى لو href اتكرر
+  for (const id of nameById.keys()) {
+    if (seen.has(id)) continue;
+    if (countById.has(id) || imgById.has(id)) {
+      seen.add(id);
+      out.push({ id, name: nameById.get(id), image_url: null, count: null });
+    }
+  }
+
   for (const row of out) {
     if (!row.name && nameById.has(row.id)) row.name = nameById.get(row.id);
-    if (!row.name) {
-      const near = new RegExp(
-        pathPrefix.replace(/\//g, "\\/") +
-          row.id +
-          String.raw`[\s\S]{0,800}?alt":"([^"]{2,100})"`,
-        ""
-      );
-      const nm = flight.match(near);
-      if (nm) row.name = nm[1].trim();
-    }
-    if (row.name && imgByName.has(row.name)) {
-      row.image_url = imgByName.get(row.name);
-    }
+    row.image_url = imgById.get(row.id) || (row.name && imgByName.get(row.name)) || null;
+    if (countById.has(row.id)) row.count = countById.get(row.id);
   }
 
   return out;
@@ -502,12 +544,14 @@ export async function thTeachers(subjectId) {
   if (hit) return hit;
   const html = await getHtml(`/subjects/${th}`);
   const flight = extractFlight(html) + "\n" + html;
-  const rows = parseArticleList(flight, "/teachers/");
+  const rows = parseArticleList(flight, "/teachers/", ["فصول", "فصل"]);
   const teachers = rows.map((r) => ({
     id: encodeThId(r.id),
     name: r.name || `مدرس ${r.id}`,
     image_url: r.image_url || null,
     subject_id: encodeThId(th),
+    chapters_count: r.count != null ? r.count : null,
+    count: r.count != null ? r.count : null, // توافق فرونت قديم
     _source: "thanawica",
     _thId: r.id
   }));
@@ -523,11 +567,14 @@ export async function thChapters(teacherId) {
   if (hit) return hit;
   const html = await getHtml(`/teachers/${th}`);
   const flight = extractFlight(html) + "\n" + html;
-  const rows = parseArticleList(flight, "/chapters/");
+  const rows = parseArticleList(flight, "/chapters/", ["المحاضرات", "محاضرات"]);
   const chapters = rows.map((r) => ({
     id: encodeThId(r.id),
     name: r.name || `وحدة ${r.id}`,
+    image_url: r.image_url || null,
     teacher_id: encodeThId(th),
+    lectures_count: r.count != null ? r.count : null,
+    count: r.count != null ? r.count : null,
     _source: "thanawica",
     _thId: r.id
   }));
@@ -543,11 +590,14 @@ export async function thLectures(chapterId) {
   if (hit) return hit;
   const html = await getHtml(`/chapters/${th}`);
   const flight = extractFlight(html) + "\n" + html;
-  const rows = parseArticleList(flight, "/lectures/");
+  const rows = parseArticleList(flight, "/lectures/", ["الفيديوهات", "فيديوهات", "فيديو", "ملفات"]);
   const lectures = rows.map((r) => ({
     id: encodeThId(r.id),
     name: r.name || `محاضرة ${r.id}`,
+    image_url: r.image_url || null,
     chapter_id: encodeThId(th),
+    videos_count: r.count != null ? r.count : null,
+    count: r.count != null ? r.count : null,
     _source: "thanawica",
     _thId: r.id
   }));
@@ -648,6 +698,29 @@ export async function thLectureContent(lectureId) {
     if (title && !/مشاهدة|رجوع|تنزيل|فتح/.test(title)) videoTitleById.set(vid, title);
   }
 
+  // المدد: "ساعة و35 دقيقة" قبل رابط الفيديو
+  const videoDurById = new Map();
+  for (const m of flight.matchAll(
+    /((?:ساعتين|ساعة(?:\s*و\s*\d+)?|\d+\s*ساعات?)(?:\s*و?\s*\d+\s*)?دقيقة|\d+\s*دقائق?)[\s\S]{0,1200}?\/lectures\/\d+\/videos\/(\d+)/g
+  )) {
+    const sec = parseArabicDuration(m[1]);
+    if (sec) videoDurById.set(m[2], sec);
+  }
+  // fallback أوسع
+  for (const m of flight.matchAll(/\/lectures\/\d+\/videos\/(\d+)/g)) {
+    const vid = m[1];
+    if (videoDurById.has(vid)) continue;
+    const idx = m.index ?? flight.indexOf(m[0]);
+    const before = flight.slice(Math.max(0, idx - 1500), idx);
+    const dm = before.match(
+      /((?:ساعتين|ساعة(?:\s*و\s*\d+)?|\d+\s*ساعات?)[^\n"]{0,20}دقيقة|\d+\s*دقائق?)\s*"?\s*\]/
+    );
+    if (dm) {
+      const sec = parseArabicDuration(dm[1]);
+      if (sec) videoDurById.set(vid, sec);
+    }
+  }
+
   const videos = [];
   const seen = new Set();
   for (const m of flight.matchAll(/\/lectures\/\d+\/videos\/(\d+)/g)) {
@@ -657,11 +730,14 @@ export async function thLectureContent(lectureId) {
     const vName =
       videoTitleById.get(vid) ||
       (lecName && !/^محاضرة \d+$/.test(lecName) ? lecName : `فيديو ${vid}`);
+    const dur = videoDurById.get(vid) || null;
     videos.push({
       id: `thv_${vid}`,
       name: vName,
       title: vName,
       type: "video",
+      duration: dur,
+      duration_seconds: dur,
       _source: "thanawica",
       _videoPageId: vid,
       _lectureId: th
