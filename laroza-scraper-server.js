@@ -1,22 +1,26 @@
 /**
  * ============================================================================
- * LAROZA1.LAT FULL SCRAPER & PROXY SERVER  v2.1
+ * LAROZA1.LAT FULL SCRAPER & PROXY SERVER  v2.2 (FIXED)
  * ============================================================================
- * Comprehensive Node.js server that connects to https://laroza1.lat
- * extracts movies, series, multi-server embeds, download links...
+ * Fixes vs v2.1:
+ *  - Aggressive CF cooldown reduced + smarter recovery
+ *  - Light scrape path (play + embeds only) – default for player
+ *  - In-memory TTL cache for play/embeds (avoids re-hitting CF)
+ *  - Frontend: cache-first, clear Arabic errors, retry, progress text
+ *  - Lower default delays, maxProbe default 0 on light path
+ *  - Queue no longer floods on every home hit
+ *  - Better timeout / error surfaces
  *
- * New in v2.1:
- *  - Proxy support (HTTP / SOCKS5) + rotation
- *  - Stronger Cloudflare-resistant headers & cookie jar
- *  - m3u8 / direct stream probing helpers for common hosts
- *  - Improved web dashboard
- *  - dotenv configuration
- *  - Better error recovery & stats
- * ============================================================================
  * Usage:
- *   cp .env.example .env
+ *   cp .env.example .env   (optional)
  *   npm install
  *   node laroza-scraper-server.js
+ *
+ * Recommended env on Railway:
+ *   PROXY_URL=http://user:pass@host:port
+ *   # or PROXY_LIST=url1,url2
+ *   REQUEST_DELAY_MS=450
+ *   MAX_RETRIES=3
  * ============================================================================
  */
 
@@ -32,8 +36,6 @@ const zlib = require('zlib');
 const { EventEmitter } = require('events');
 const crypto = require('crypto');
 const querystring = require('querystring');
-const { pipeline } = require('stream');
-const { promisify } = require('util');
 
 // Optional dependencies (loaded safely)
 let dotenv = null;
@@ -61,17 +63,17 @@ const CONFIG = {
   PORT: parseInt(process.env.PORT || '3030', 10),
   HOST: process.env.HOST || '0.0.0.0',
 
-  REQUEST_TIMEOUT: 28000,
-  MAX_RETRIES: parseInt(process.env.MAX_RETRIES || '4', 10),
-  RETRY_DELAY_MS: 1800,
-  REQUEST_DELAY_MS: parseInt(process.env.REQUEST_DELAY_MS || '900', 10),
-  CONCURRENCY: parseInt(process.env.CONCURRENCY || '3', 10),
-  MAX_PAGES_PER_CATEGORY: 30,
+  REQUEST_TIMEOUT: 22000,
+  MAX_RETRIES: parseInt(process.env.MAX_RETRIES || '3', 10),
+  RETRY_DELAY_MS: 1200,
+  REQUEST_DELAY_MS: parseInt(process.env.REQUEST_DELAY_MS || '450', 10),
+  CONCURRENCY: parseInt(process.env.CONCURRENCY || '2', 10),
+  MAX_PAGES_PER_CATEGORY: 20,
 
   DATA_DIR: path.join(__dirname, 'laroza_data'),
-  CACHE_TTL_MS: 1000 * 60 * 30,
+  CACHE_TTL_MS: 1000 * 60 * 45,          // disk-ish stats
+  MEMORY_CACHE_TTL_MS: 1000 * 60 * 12,   // play/embeds memory cache
 
-  // Proxy
   PROXY_URL: process.env.PROXY_URL || '',
   PROXY_LIST: (process.env.PROXY_LIST || '').split(',').map(s => s.trim()).filter(Boolean),
 
@@ -121,7 +123,6 @@ const CONFIG = {
     'Connection': 'keep-alive'
   },
 
-  // Domains that often expose m3u8 or direct streams
   M3U8_FRIENDLY_HOSTS: [
     'streamhls', 'vidmoly', 'voe.sx', 'mixdrop', 'dsvplay',
     'okhd.site', 'film77', 'vidoba', 'mp4plus', 'anafast',
@@ -129,13 +130,832 @@ const CONFIG = {
   ]
 };
 
+// ============================================================================
+// EMBEDDED FRONTEND (fixed UX)
+// ============================================================================
+const EMBEDDED_HTML = `<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>لاروزا بلاير</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
+</head>
+<body>
+  <header class="header">
+    <div class="container header-inner">
+      <div class="logo" onclick="goHome()">
+        <span class="logo-icon">▶</span>
+        <span>لاروزا بلاير</span>
+      </div>
+      <div class="search-box">
+        <input type="text" id="searchInput" placeholder="ابحث عن فيلم أو مسلسل..." autocomplete="off">
+        <button onclick="doSearch()">بحث</button>
+      </div>
+      <div class="server-config">
+        <input type="text" id="apiBase" placeholder="رابط API">
+        <button class="btn-sm" onclick="saveApiBase()">حفظ</button>
+      </div>
+    </div>
+  </header>
 
-// ============================================================================
-// EMBEDDED FRONTEND (single-file deploy – no public/ folder needed)
-// ============================================================================
-const EMBEDDED_HTML = "<!DOCTYPE html>\n<html lang=\"ar\" dir=\"rtl\">\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\">\n  <title>لاروزا بلاير</title>\n  <link rel=\"stylesheet\" href=\"/style.css\">\n  <script src=\"https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js\"></script>\n</head>\n<body>\n  <header class=\"header\">\n    <div class=\"container header-inner\">\n      <div class=\"logo\" onclick=\"goHome()\">\n        <span class=\"logo-icon\">▶</span>\n        <span>لاروزا بلاير</span>\n      </div>\n      <div class=\"search-box\">\n        <input type=\"text\" id=\"searchInput\" placeholder=\"ابحث عن فيلم أو مسلسل...\" autocomplete=\"off\">\n        <button onclick=\"doSearch()\">بحث</button>\n      </div>\n      <div class=\"server-config\">\n        <input type=\"text\" id=\"apiBase\" placeholder=\"رابط API\">\n        <button class=\"btn-sm\" onclick=\"saveApiBase()\">حفظ</button>\n      </div>\n    </div>\n  </header>\n\n  <main class=\"container\">\n    <section id=\"homeSection\">\n      <div class=\"section-header\">\n        <h2>أحدث الإضافات</h2>\n        <button class=\"btn-outline\" onclick=\"loadHome(true)\">تحديث</button>\n      </div>\n      <div id=\"homeGrid\" class=\"video-grid\"><div class=\"loading\">جاري التحميل...</div></div>\n      <div class=\"section-header\" style=\"margin-top:28px\"><h2>التصنيفات</h2></div>\n      <div id=\"categories\" class=\"cats\"></div>\n    </section>\n\n    <section id=\"searchSection\" class=\"hidden\">\n      <div class=\"section-header\">\n        <h2>نتائج: <span id=\"searchQuery\"></span></h2>\n        <button class=\"btn-outline\" onclick=\"goHome()\">العودة</button>\n      </div>\n      <div id=\"searchGrid\" class=\"video-grid\"></div>\n    </section>\n\n    <section id=\"catSection\" class=\"hidden\">\n      <div class=\"section-header\">\n        <h2 id=\"catTitle\">تصنيف</h2>\n        <button class=\"btn-outline\" onclick=\"goHome()\">العودة</button>\n      </div>\n      <div id=\"catGrid\" class=\"video-grid\"></div>\n    </section>\n\n    <section id=\"playerSection\" class=\"hidden\">\n      <div class=\"player-wrap\">\n        <div class=\"player-top\">\n          <button class=\"btn-outline\" onclick=\"goHome()\">← رجوع</button>\n          <h1 id=\"playerTitle\">...</h1>\n        </div>\n        <div class=\"player-frame-wrap\">\n          <iframe id=\"playerFrame\" src=\"about:blank\" allowfullscreen\n            allow=\"autoplay; fullscreen; encrypted-media; picture-in-picture\"\n            referrerpolicy=\"no-referrer\"></iframe>\n          <video id=\"directVideo\" controls playsinline style=\"display:none\"></video>\n          <div id=\"playerPlaceholder\" class=\"player-placeholder\"><p>جاري التحميل...</p></div>\n        </div>\n        <div id=\"directActions\" class=\"direct-actions\"></div>\n        <div class=\"servers-bar\">\n          <span class=\"servers-label\">السيرفرات:</span>\n          <div id=\"serversList\" class=\"servers-list\"></div>\n        </div>\n        <div class=\"meta-row\" id=\"playerMeta\"></div>\n\n        <div class=\"episodes-box\" id=\"episodesBox\" style=\"display:none\">\n          <h3>الحلقات</h3>\n          <div id=\"episodesList\" class=\"episodes-list\"></div>\n        </div>\n\n        <div class=\"downloads-box\" id=\"downloadsBox\" style=\"display:none\">\n          <h3>روابط التحميل</h3>\n          <div id=\"downloadsList\"></div>\n        </div>\n        <div class=\"m3u8-box\" id=\"m3u8Box\" style=\"display:none\">\n          <h3>تشغيل مباشر (m3u8 / mp4)</h3>\n          <div id=\"m3u8List\"></div>\n        </div>\n        <div class=\"related\" id=\"relatedBox\" style=\"display:none\">\n          <h3>قد يعجبك</h3>\n          <div id=\"relatedGrid\" class=\"video-grid small\"></div>\n        </div>\n      </div>\n    </section>\n  </main>\n\n  <footer class=\"footer\">\n    <div class=\"container\">\n      <span>Laroza Player</span>\n      <span id=\"apiStatus\" class=\"status offline\">غير متصل</span>\n    </div>\n  </footer>\n  <div id=\"toast\" class=\"toast hidden\"></div>\n  <script src=\"/app.js\"></script>\n</body>\n</html>\n";
-const EMBEDDED_CSS = ":root {\n  --bg: #0b0b0f;\n  --surface: #12121a;\n  --card: #1a1a24;\n  --border: #2a2a3a;\n  --text: #f2f2f7;\n  --muted: #9a9aad;\n  --accent: #e50914;\n  --accent2: #ff6b35;\n  --radius: 14px;\n  --shadow: 0 12px 40px rgba(0,0,0,.45);\n}\n* { box-sizing: border-box; margin: 0; padding: 0; }\nhtml { scroll-behavior: smooth; }\nbody {\n  font-family: 'Segoe UI', Tahoma, Arial, sans-serif;\n  background: radial-gradient(ellipse at top, #161622 0%, var(--bg) 55%);\n  color: var(--text);\n  min-height: 100vh;\n  line-height: 1.5;\n}\n.container { width: 100%; max-width: 1280px; margin: 0 auto; padding: 0 18px; }\n.hidden { display: none !important; }\n\n.header {\n  background: rgba(10,10,15,.85);\n  backdrop-filter: blur(16px);\n  border-bottom: 1px solid var(--border);\n  position: sticky; top: 0; z-index: 100;\n}\n.header-inner {\n  display: flex; align-items: center; gap: 14px;\n  padding: 12px 0; flex-wrap: wrap;\n}\n.logo {\n  display: flex; align-items: center; gap: 10px;\n  font-weight: 800; font-size: 1.2rem; cursor: pointer; white-space: nowrap;\n}\n.logo-icon {\n  width: 36px; height: 36px; border-radius: 10px;\n  background: linear-gradient(135deg, var(--accent), var(--accent2));\n  display: flex; align-items: center; justify-content: center;\n  box-shadow: 0 4px 16px rgba(229,9,20,.35);\n}\n.search-box { flex: 1; display: flex; min-width: 200px; max-width: 460px; }\n.search-box input {\n  flex: 1; background: var(--card); border: 1px solid var(--border);\n  border-radius: 999px 0 0 999px; padding: 11px 16px; color: var(--text); outline: none;\n}\n.search-box input:focus { border-color: var(--accent); }\n.search-box button {\n  background: var(--accent); border: none; color: #fff;\n  padding: 0 20px; border-radius: 0 999px 999px 0; cursor: pointer; font-weight: 700;\n}\n.server-config { display: flex; gap: 6px; align-items: center; }\n.server-config input {\n  background: var(--card); border: 1px solid var(--border); border-radius: 10px;\n  padding: 8px 10px; color: var(--muted); font-size: .78rem; width: 170px;\n}\n.btn-sm, .btn-outline {\n  background: transparent; border: 1px solid var(--border); color: var(--text);\n  padding: 8px 14px; border-radius: 10px; cursor: pointer; font-size: .85rem;\n}\n.btn-sm:hover, .btn-outline:hover { border-color: var(--accent); color: #fff; }\n\nmain.container { padding-top: 22px; padding-bottom: 90px; }\n.section-header {\n  display: flex; align-items: center; justify-content: space-between;\n  margin: 8px 0 16px;\n}\n.section-header h2 { font-size: 1.3rem; font-weight: 800; }\n\n.video-grid {\n  display: grid;\n  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));\n  gap: 16px;\n}\n.video-grid.small { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; }\n\n.video-card {\n  background: var(--card); border-radius: var(--radius); overflow: hidden;\n  cursor: pointer; transition: transform .2s, box-shadow .2s;\n  border: 1px solid transparent; position: relative;\n}\n.video-card:hover {\n  transform: translateY(-6px) scale(1.02);\n  box-shadow: var(--shadow);\n  border-color: rgba(229,9,20,.35);\n}\n.video-card .thumb-wrap {\n  position: relative; aspect-ratio: 2/3; background: #1a1a22; overflow: hidden;\n}\n.video-card .thumb {\n  width: 100%; height: 100%; object-fit: cover; display: block;\n  transition: transform .35s;\n}\n.video-card:hover .thumb { transform: scale(1.08); }\n.video-card .badge {\n  position: absolute; top: 8px; right: 8px;\n  background: rgba(229,9,20,.92); color: #fff;\n  font-size: .7rem; font-weight: 700; padding: 3px 8px; border-radius: 6px;\n}\n.video-card .play-overlay {\n  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;\n  background: rgba(0,0,0,.35); opacity: 0; transition: .2s;\n}\n.video-card:hover .play-overlay { opacity: 1; }\n.video-card .play-overlay span {\n  width: 44px; height: 44px; border-radius: 50%;\n  background: var(--accent); display: flex; align-items: center; justify-content: center;\n  font-size: 16px; box-shadow: 0 6px 20px rgba(0,0,0,.4);\n}\n.video-card .info { padding: 10px 11px 12px; }\n.video-card .title {\n  font-size: .82rem; font-weight: 700;\n  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;\n  overflow: hidden; line-height: 1.35; min-height: 2.2em;\n}\n.video-card .meta { font-size: .72rem; color: var(--muted); margin-top: 4px; }\n\n.loading, .empty {\n  grid-column: 1 / -1; text-align: center; padding: 48px 20px; color: var(--muted);\n}\n.skeleton-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }\n.skeleton {\n  aspect-ratio: 2/3; border-radius: var(--radius);\n  background: linear-gradient(90deg, #1a1a24 25%, #242433 50%, #1a1a24 75%);\n  background-size: 200% 100%; animation: shimmer 1.2s infinite;\n}\n@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }\n\n.cats { display: flex; flex-wrap: wrap; gap: 8px; }\n.cat-chip {\n  background: var(--card); border: 1px solid var(--border);\n  padding: 8px 14px; border-radius: 999px; cursor: pointer; font-size: .86rem;\n  transition: .15s;\n}\n.cat-chip:hover, .cat-chip.active {\n  background: var(--accent); border-color: var(--accent); color: #fff;\n}\n\n/* Player */\n.player-wrap { max-width: 1000px; margin: 0 auto; }\n.player-top {\n  display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap;\n}\n.player-top h1 { font-size: 1.25rem; flex: 1; font-weight: 800; }\n.player-frame-wrap {\n  position: relative; width: 100%; padding-top: 56.25%;\n  background: #000; border-radius: 16px; overflow: hidden;\n  border: 1px solid var(--border); box-shadow: var(--shadow);\n}\n.player-frame-wrap iframe, #directVideo {\n  position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000;\n}\n.player-placeholder {\n  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;\n  background: #111; color: var(--muted); font-size: 1.05rem;\n}\n.direct-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }\n.servers-bar {\n  display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap;\n}\n.servers-label { color: var(--muted); font-size: .88rem; }\n.servers-list { display: flex; flex-wrap: wrap; gap: 8px; }\n.server-btn {\n  background: var(--card); border: 1px solid var(--border); color: var(--text);\n  padding: 8px 13px; border-radius: 10px; cursor: pointer; font-size: .84rem; transition: .15s;\n}\n.server-btn:hover { border-color: var(--accent); }\n.server-btn.active, .server-btn.accent {\n  background: var(--accent); border-color: var(--accent); color: #fff;\n}\n.meta-row { margin-top: 12px; color: var(--muted); font-size: .9rem; }\n\n.episodes-box, .downloads-box, .m3u8-box, .related {\n  margin-top: 22px; background: var(--surface); border-radius: 16px;\n  padding: 16px; border: 1px solid var(--border);\n}\n.episodes-box h3, .downloads-box h3, .m3u8-box h3, .related h3 {\n  margin-bottom: 12px; font-size: 1rem;\n}\n.episodes-list {\n  display: flex; flex-wrap: wrap; gap: 8px; max-height: 220px; overflow-y: auto;\n}\n.ep-btn {\n  background: var(--card); border: 1px solid var(--border); color: var(--text);\n  padding: 8px 12px; border-radius: 10px; cursor: pointer; font-size: .82rem;\n  min-width: 92px; text-align: center;\n}\n.ep-btn:hover { border-color: var(--accent); }\n.ep-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }\n\n#downloadsList a, #m3u8List a {\n  display: inline-block; background: var(--card); border: 1px solid var(--border);\n  color: #8ec7ff; padding: 8px 12px; border-radius: 8px; margin: 4px;\n  text-decoration: none; font-size: .84rem;\n}\n\n.footer {\n  border-top: 1px solid var(--border); padding: 14px 0; background: var(--surface);\n  font-size: .84rem; color: var(--muted);\n}\n.footer .container { display: flex; justify-content: space-between; align-items: center; }\n.status { padding: 3px 10px; border-radius: 999px; font-size: .75rem; }\n.status.online { background: rgba(46,204,113,.15); color: #2ecc71; }\n.status.offline { background: rgba(229,9,20,.15); color: var(--accent); }\n\n.toast {\n  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);\n  background: var(--card); border: 1px solid var(--border); padding: 12px 20px;\n  border-radius: 12px; box-shadow: var(--shadow); z-index: 200; transition: opacity .3s;\n}\n.toast.hidden { opacity: 0; pointer-events: none; }\n\n@media (max-width: 640px) {\n  .video-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; }\n  .server-config input { width: 110px; }\n  .player-top h1 { font-size: 1rem; }\n}\n";
-const EMBEDDED_JS = "const DEFAULT_API = window.location.origin;\nlet API_BASE = localStorage.getItem('laroza_api') || DEFAULT_API;\nconst LAROZA_CDN = 'https://laroza1.lat';\n\nconst $ = s => document.querySelector(s);\nconst $$ = s => document.querySelectorAll(s);\nlet hlsInstance = null;\nlet currentVideo = null;\n\nasync function api(path, options = {}) {\n  const ctrl = new AbortController();\n  const t = setTimeout(() => ctrl.abort(), 90000);\n  try {\n    const res = await fetch(API_BASE.replace(/\\/$/, '') + path, {\n      ...options,\n      signal: ctrl.signal,\n      headers: { Accept: 'application/json', ...(options.headers || {}) }\n    });\n    if (!res.ok) {\n      const err = await res.json().catch(() => ({ error: res.statusText }));\n      throw new Error(err.error || `HTTP ${res.status}`);\n    }\n    return res.json();\n  } finally {\n    clearTimeout(t);\n  }\n}\n\nfunction toast(msg, ms = 2800) {\n  const el = $('#toast');\n  el.textContent = msg;\n  el.classList.remove('hidden');\n  clearTimeout(el._t);\n  el._t = setTimeout(() => el.classList.add('hidden'), ms);\n}\n\nfunction setStatus(online) {\n  const el = $('#apiStatus');\n  el.textContent = online ? 'متصل' : 'غير متصل';\n  el.className = 'status ' + (online ? 'online' : 'offline');\n}\n\nfunction hideAll() {\n  ['homeSection', 'searchSection', 'catSection', 'playerSection'].forEach(id => {\n    const el = $('#' + id); if (el) el.classList.add('hidden');\n  });\n}\nfunction goHome() {\n  stopDirectPlayer();\n  hideAll();\n  $('#homeSection').classList.remove('hidden');\n  history.replaceState(null, '', '#');\n}\nfunction showSearch(q) {\n  hideAll();\n  $('#searchSection').classList.remove('hidden');\n  $('#searchQuery').textContent = q;\n}\nfunction showCat(name) {\n  hideAll();\n  $('#catSection').classList.remove('hidden');\n  $('#catTitle').textContent = name;\n}\nfunction showPlayer() {\n  hideAll();\n  $('#playerSection').classList.remove('hidden');\n}\n\nfunction escapeHtml(s) {\n  return String(s || '').replace(/[&<>\"']/g, c =>\n    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c])\n  );\n}\n\nfunction thumbUrl(v) {\n  if (v.thumbnail && /^https?:\\/\\//.test(v.thumbnail)) return v.thumbnail;\n  if (v.thumb && /^https?:\\/\\//.test(v.thumb)) return v.thumb;\n  // fallback pattern used by the site\n  if (v.vid) return `${LAROZA_CDN}/uploads/thumbs/${v.vid}-1.jpg`;\n  return '';\n}\n\nfunction placeholderThumb() {\n  return 'data:image/svg+xml,' + encodeURIComponent(\n    `<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"300\" height=\"450\"><defs><linearGradient id=\"g\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"><stop stop-color=\"#1a1a24\"/><stop offset=\"1\" stop-color=\"#2a2a38\"/></linearGradient></defs><rect fill=\"url(#g)\" width=\"300\" height=\"450\"/><text x=\"150\" y=\"230\" fill=\"#666\" font-size=\"16\" text-anchor=\"middle\" font-family=\"Arial\">Laroza</text></svg>`\n  );\n}\n\nfunction isEpisodeTitle(title) {\n  return /الحلقة|حلقه|Episode/i.test(title || '');\n}\n\nfunction videoCard(v) {\n  const title = v.title || v.vid || 'بدون عنوان';\n  const thumb = thumbUrl(v) || placeholderThumb();\n  const year = v.year || '';\n  const badge = isEpisodeTitle(title) ? '<span class=\"badge\">حلقة</span>' : (year ? `<span class=\"badge\">${escapeHtml(year)}</span>` : '');\n  return `\n    <div class=\"video-card\" onclick=\"openVideo('${escapeHtml(v.vid)}')\">\n      <div class=\"thumb-wrap\">\n        <img class=\"thumb\" src=\"${escapeHtml(thumb)}\" alt=\"\" loading=\"lazy\"\n          onerror=\"this.onerror=null;this.src='${placeholderThumb()}'\">\n        ${badge}\n        <div class=\"play-overlay\"><span>▶</span></div>\n      </div>\n      <div class=\"info\">\n        <div class=\"title\">${escapeHtml(title)}</div>\n        <div class=\"meta\">${escapeHtml(v.duration || '')}</div>\n      </div>\n    </div>`;\n}\n\nfunction renderGrid(el, videos) {\n  if (!videos || !videos.length) {\n    el.innerHTML = '<div class=\"empty\">لا توجد نتائج</div>';\n    return;\n  }\n  el.innerHTML = videos.map(videoCard).join('');\n}\n\nfunction skeletons(el, n = 12) {\n  el.innerHTML = `<div class=\"skeleton-grid\">${Array.from({length:n}).map(()=>'<div class=\"skeleton\"></div>').join('')}</div>`;\n}\n\nasync function checkHealth() {\n  try {\n    await api('/health');\n    setStatus(true);\n    return true;\n  } catch {\n    setStatus(false);\n    return false;\n  }\n}\n\nasync function loadHome(force = false) {\n  const grid = $('#homeGrid');\n  skeletons(grid, 12);\n  try {\n    let videos = [];\n    if (!force) {\n      try {\n        const stored = await api('/api/videos?limit=48');\n        videos = stored.videos || [];\n      } catch {}\n    }\n    if (!videos.length || force) {\n      const home = await api('/api/scrape/home?limit=48');\n      videos = home.videos || [];\n    }\n    renderGrid(grid, videos);\n  } catch (e) {\n    grid.innerHTML = `<div class=\"empty\">فشل التحميل: ${escapeHtml(e.message)}</div>`;\n    toast('خطأ في الاتصال بالسيرفر');\n  }\n}\n\nasync function loadCategories() {\n  const box = $('#categories');\n  try {\n    const cats = await api('/api/categories');\n    box.innerHTML = Object.entries(cats).map(([key, info]) =>\n      `<span class=\"cat-chip\" onclick=\"openCategory('${key}', '${escapeHtml(info.name)}')\">${escapeHtml(info.name)}</span>`\n    ).join('');\n  } catch {\n    box.innerHTML = '';\n  }\n}\n\nasync function doSearch() {\n  const q = $('#searchInput').value.trim();\n  if (!q) return;\n  showSearch(q);\n  const grid = $('#searchGrid');\n  skeletons(grid, 10);\n  try {\n    let results = [];\n    try {\n      const local = await api('/api/search/local?q=' + encodeURIComponent(q));\n      results = local.results || [];\n    } catch {}\n    if (!results.length) {\n      const live = await api('/api/scrape/search?q=' + encodeURIComponent(q));\n      results = live.videos || [];\n    }\n    renderGrid(grid, results);\n  } catch (e) {\n    grid.innerHTML = `<div class=\"empty\">${escapeHtml(e.message)}</div>`;\n  }\n}\n\nasync function openCategory(catKey, name) {\n  showCat(name || catKey);\n  const grid = $('#catGrid');\n  skeletons(grid, 12);\n  try {\n    const data = await api(`/api/scrape/category/${encodeURIComponent(catKey)}?pages=1`);\n    renderGrid(grid, data.videos || []);\n  } catch (e) {\n    grid.innerHTML = `<div class=\"empty\">${escapeHtml(e.message)}</div>`;\n  }\n}\n\nfunction stopDirectPlayer() {\n  const video = $('#directVideo');\n  if (hlsInstance) { try { hlsInstance.destroy(); } catch {} hlsInstance = null; }\n  if (video) {\n    video.pause();\n    video.removeAttribute('src');\n    video.load();\n    video.style.display = 'none';\n  }\n  const frame = $('#playerFrame');\n  if (frame) frame.style.display = 'block';\n}\n\nfunction playDirect(url, typeHint) {\n  const video = $('#directVideo');\n  const frame = $('#playerFrame');\n  const placeholder = $('#playerPlaceholder');\n  if (!video) return;\n  stopDirectPlayer();\n  frame.style.display = 'none';\n  frame.src = 'about:blank';\n  placeholder.style.display = 'none';\n  video.style.display = 'block';\n  const isHls = /\\.m3u8(\\?|$)/i.test(url) || typeHint === 'm3u8';\n  if (isHls && window.Hls && Hls.isSupported()) {\n    hlsInstance = new Hls({ enableWorker: true, backBufferLength: 90 });\n    hlsInstance.loadSource(url);\n    hlsInstance.attachMedia(video);\n    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));\n    hlsInstance.on(Hls.Events.ERROR, (_, data) => {\n      if (data.fatal) toast('فشل تشغيل m3u8');\n    });\n  } else if (video.canPlayType('application/vnd.apple.mpegurl') && isHls) {\n    video.src = url; video.play().catch(() => {});\n  } else {\n    video.src = url; video.play().catch(() => {});\n  }\n}\n\nfunction playServer(btn, embedUrl) {\n  $$('.server-btn').forEach(b => b.classList.remove('active'));\n  if (btn) btn.classList.add('active');\n  stopDirectPlayer();\n  const frame = $('#playerFrame');\n  const placeholder = $('#playerPlaceholder');\n  const video = $('#directVideo');\n  if (video) video.style.display = 'none';\n  frame.style.display = 'block';\n  if (!embedUrl) {\n    frame.src = 'about:blank';\n    placeholder.style.display = 'flex';\n    placeholder.innerHTML = '<p>لا يوجد رابط</p>';\n    return;\n  }\n  placeholder.style.display = 'none';\n  frame.src = embedUrl;\n}\n\nfunction renderEpisodes(episodes, currentVid) {\n  const box = $('#episodesBox');\n  const list = $('#episodesList');\n  if (!episodes || !episodes.length) {\n    box.style.display = 'none';\n    return;\n  }\n  box.style.display = 'block';\n  list.innerHTML = episodes.map(ep => {\n    const active = ep.vid === currentVid ? 'active' : '';\n    const label = ep.label || ep.title || ep.vid;\n    return `<button class=\"ep-btn ${active}\" onclick=\"openVideo('${escapeHtml(ep.vid)}')\">${escapeHtml(label)}</button>`;\n  }).join('');\n}\n\nasync function openVideo(vid) {\n  showPlayer();\n  stopDirectPlayer();\n  $('#playerTitle').textContent = 'جاري التحميل...';\n  $('#playerFrame').src = 'about:blank';\n  $('#playerFrame').style.display = 'block';\n  $('#playerPlaceholder').style.display = 'flex';\n  $('#playerPlaceholder').innerHTML = '<p>جاري جلب السيرفرات والصور...</p>';\n  $('#serversList').innerHTML = '';\n  $('#downloadsBox').style.display = 'none';\n  $('#m3u8Box').style.display = 'none';\n  $('#relatedBox').style.display = 'none';\n  $('#episodesBox').style.display = 'none';\n  $('#playerMeta').textContent = '';\n  $('#directActions').innerHTML = '';\n  history.replaceState(null, '', '#play/' + vid);\n\n  try {\n    const data = await api(`/api/scrape/video/${encodeURIComponent(vid)}?maxProbe=5`);\n    currentVideo = data;\n    $('#playerTitle').textContent = data.title || vid;\n\n    const parts = [];\n    if (data.duration) parts.push(data.duration);\n    if (data.year) parts.push(data.year);\n    if (data.embeds) parts.push(data.embeds.length + ' سيرفر');\n    if (data.episodes && data.episodes.length) parts.push(data.episodes.length + ' حلقة');\n    $('#playerMeta').textContent = parts.join(' • ');\n\n    // poster in meta via browser tab title already set\n    if (data.thumbnail) {\n      // no dedicated poster UI needed; cards use it\n    }\n\n    const list = $('#serversList');\n    if (data.embeds && data.embeds.length) {\n      list.innerHTML = data.embeds.map((s, i) =>\n        `<button class=\"server-btn ${i === 0 ? 'active' : ''}\" onclick=\"playServer(this, '${escapeHtml(s.url)}')\">سيرفر ${s.id || (i + 1)}</button>`\n      ).join('');\n      playServer(list.querySelector('.server-btn'), data.embeds[0].url);\n    } else {\n      list.innerHTML = '<span style=\"color:var(--muted)\">لا توجد سيرفرات</span>';\n      $('#playerPlaceholder').innerHTML = '<p>لا توجد سيرفرات متاحة</p>';\n    }\n\n    renderEpisodes(data.episodes || [], vid);\n\n    if (data.downloads && data.downloads.length) {\n      $('#downloadsBox').style.display = 'block';\n      $('#downloadsList').innerHTML = data.downloads.map(d =>\n        `<a href=\"${escapeHtml(d.url)}\" target=\"_blank\" rel=\"noopener\">${escapeHtml(d.host || 'تحميل')}</a>`\n      ).join('');\n    }\n\n    const directs = [];\n    (data.m3u8Probes || []).forEach(p => {\n      if (p.m3u8) directs.push({ url: p.m3u8, type: 'm3u8', label: 'm3u8' });\n      if (p.mp4) directs.push({ url: p.mp4, type: 'mp4', label: 'mp4' });\n      (p.sources || []).forEach(s => {\n        if (s && s !== p.m3u8 && s !== p.mp4) {\n          const t = /\\.m3u8/i.test(s) ? 'm3u8' : (/\\.mp4/i.test(s) ? 'mp4' : 'src');\n          directs.push({ url: s, type: t, label: t });\n        }\n      });\n    });\n    const seen = new Set();\n    const unique = directs.filter(d => { if (seen.has(d.url)) return false; seen.add(d.url); return true; });\n    if (unique.length) {\n      $('#m3u8Box').style.display = 'block';\n      $('#m3u8List').innerHTML = unique.map((d, i) =>\n        `<a href=\"${escapeHtml(d.url)}\" target=\"_blank\">${d.label}</a>\n         <button class=\"server-btn\" onclick=\"playDirect('${escapeHtml(d.url)}', '${d.type}')\">▶ تشغيل</button>`\n      ).join('');\n      $('#directActions').innerHTML = unique.slice(0, 3).map(d =>\n        `<button class=\"server-btn accent\" onclick=\"playDirect('${escapeHtml(d.url)}', '${d.type}')\">▶ ${d.label} مباشر</button>`\n      ).join('');\n    }\n\n    if (data.related && data.related.length) {\n      $('#relatedBox').style.display = 'block';\n      renderGrid($('#relatedGrid'), data.related);\n    }\n  } catch (e) {\n    $('#playerTitle').textContent = 'فشل التحميل';\n    $('#playerMeta').textContent = e.message;\n    $('#playerPlaceholder').innerHTML = `<p>${escapeHtml(e.message)}</p>`;\n    toast('تعذر فتح الفيديو');\n  }\n}\n\nfunction saveApiBase() {\n  const val = $('#apiBase').value.trim().replace(/\\/$/, '');\n  if (!val) return toast('اكتب رابط السيرفر');\n  API_BASE = val;\n  localStorage.setItem('laroza_api', val);\n  toast('تم الحفظ');\n  checkHealth().then(ok => { if (ok) { loadHome(true); loadCategories(); } });\n}\n\nfunction initApiBaseInput() {\n  $('#apiBase').value = API_BASE;\n  $('#apiBase').addEventListener('keydown', e => { if (e.key === 'Enter') saveApiBase(); });\n  $('#searchInput').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });\n}\n\nasync function boot() {\n  initApiBaseInput();\n  const hash = location.hash || '';\n  if (hash.startsWith('#play/')) {\n    const vid = hash.replace('#play/', '');\n    if (vid) {\n      await checkHealth();\n      openVideo(vid);\n      loadCategories();\n      return;\n    }\n  }\n  const ok = await checkHealth();\n  if (ok) await Promise.all([loadHome(), loadCategories()]);\n  else {\n    $('#homeGrid').innerHTML = `<div class=\"empty\">السيرفر غير متصل<br><small>ضع رابط الـ API ثم احفظ</small></div>`;\n  }\n}\nboot();\n";
+  <main class="container">
+    <section id="homeSection">
+      <div class="section-header">
+        <h2>أحدث الإضافات</h2>
+        <button class="btn-outline" onclick="loadHome(true)">تحديث</button>
+      </div>
+      <div id="homeGrid" class="video-grid"><div class="loading">جاري التحميل...</div></div>
+      <div class="section-header" style="margin-top:28px"><h2>التصنيفات</h2></div>
+      <div id="categories" class="cats"></div>
+    </section>
+
+    <section id="searchSection" class="hidden">
+      <div class="section-header">
+        <h2>نتائج: <span id="searchQuery"></span></h2>
+        <button class="btn-outline" onclick="goHome()">العودة</button>
+      </div>
+      <div id="searchGrid" class="video-grid"></div>
+    </section>
+
+    <section id="catSection" class="hidden">
+      <div class="section-header">
+        <h2 id="catTitle">تصنيف</h2>
+        <button class="btn-outline" onclick="goHome()">العودة</button>
+      </div>
+      <div id="catGrid" class="video-grid"></div>
+    </section>
+
+    <section id="playerSection" class="hidden">
+      <div class="player-wrap">
+        <div class="player-top">
+          <button class="btn-outline" onclick="goHome()">← رجوع</button>
+          <h1 id="playerTitle">...</h1>
+        </div>
+        <div class="player-frame-wrap">
+          <iframe id="playerFrame" src="about:blank" allowfullscreen
+            allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+            referrerpolicy="no-referrer"></iframe>
+          <video id="directVideo" controls playsinline style="display:none"></video>
+          <div id="playerPlaceholder" class="player-placeholder"><p>جاري التحميل...</p></div>
+        </div>
+        <div id="directActions" class="direct-actions"></div>
+        <div class="servers-bar">
+          <span class="servers-label">السيرفرات:</span>
+          <div id="serversList" class="servers-list"></div>
+        </div>
+        <div class="meta-row" id="playerMeta"></div>
+
+        <div class="episodes-box" id="episodesBox" style="display:none">
+          <h3>الحلقات</h3>
+          <div id="episodesList" class="episodes-list"></div>
+        </div>
+
+        <div class="downloads-box" id="downloadsBox" style="display:none">
+          <h3>روابط التحميل</h3>
+          <div id="downloadsList"></div>
+        </div>
+        <div class="m3u8-box" id="m3u8Box" style="display:none">
+          <h3>تشغيل مباشر (m3u8 / mp4)</h3>
+          <div id="m3u8List"></div>
+        </div>
+        <div class="related" id="relatedBox" style="display:none">
+          <h3>قد يعجبك</h3>
+          <div id="relatedGrid" class="video-grid small"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      <span>Laroza Player v2.2</span>
+      <span id="apiStatus" class="status offline">غير متصل</span>
+    </div>
+  </footer>
+  <div id="toast" class="toast hidden"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
+`;
+
+const EMBEDDED_CSS = `:root {
+  --bg: #0b0b0f;
+  --surface: #12121a;
+  --card: #1a1a24;
+  --border: #2a2a3a;
+  --text: #f2f2f7;
+  --muted: #9a9aad;
+  --accent: #e50914;
+  --accent2: #ff6b35;
+  --radius: 14px;
+  --shadow: 0 12px 40px rgba(0,0,0,.45);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+  background: radial-gradient(ellipse at top, #161622 0%, var(--bg) 55%);
+  color: var(--text);
+  min-height: 100vh;
+  line-height: 1.5;
+}
+.container { width: 100%; max-width: 1280px; margin: 0 auto; padding: 0 18px; }
+.hidden { display: none !important; }
+
+.header {
+  background: rgba(10,10,15,.85);
+  backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 100;
+}
+.header-inner {
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 0; flex-wrap: wrap;
+}
+.logo {
+  display: flex; align-items: center; gap: 10px;
+  font-weight: 800; font-size: 1.2rem; cursor: pointer; white-space: nowrap;
+}
+.logo-icon {
+  width: 36px; height: 36px; border-radius: 10px;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 4px 16px rgba(229,9,20,.35);
+}
+.search-box { flex: 1; display: flex; min-width: 200px; max-width: 460px; }
+.search-box input {
+  flex: 1; background: var(--card); border: 1px solid var(--border);
+  border-radius: 999px 0 0 999px; padding: 11px 16px; color: var(--text); outline: none;
+}
+.search-box input:focus { border-color: var(--accent); }
+.search-box button {
+  background: var(--accent); border: none; color: #fff;
+  padding: 0 20px; border-radius: 0 999px 999px 0; cursor: pointer; font-weight: 700;
+}
+.server-config { display: flex; gap: 6px; align-items: center; }
+.server-config input {
+  background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+  padding: 8px 10px; color: var(--muted); font-size: .78rem; width: 170px;
+}
+.btn-sm, .btn-outline {
+  background: transparent; border: 1px solid var(--border); color: var(--text);
+  padding: 8px 14px; border-radius: 10px; cursor: pointer; font-size: .85rem;
+}
+.btn-sm:hover, .btn-outline:hover { border-color: var(--accent); color: #fff; }
+
+main.container { padding-top: 22px; padding-bottom: 90px; }
+.section-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 8px 0 16px;
+}
+.section-header h2 { font-size: 1.3rem; font-weight: 800; }
+
+.video-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 16px;
+}
+.video-grid.small { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; }
+
+.video-card {
+  background: var(--card); border-radius: var(--radius); overflow: hidden;
+  cursor: pointer; transition: transform .2s, box-shadow .2s;
+  border: 1px solid transparent; position: relative;
+}
+.video-card:hover {
+  transform: translateY(-6px) scale(1.02);
+  box-shadow: var(--shadow);
+  border-color: rgba(229,9,20,.35);
+}
+.video-card .thumb-wrap {
+  position: relative; aspect-ratio: 2/3; background: #1a1a22; overflow: hidden;
+}
+.video-card .thumb {
+  width: 100%; height: 100%; object-fit: cover; display: block;
+  transition: transform .35s;
+}
+.video-card:hover .thumb { transform: scale(1.08); }
+.video-card .badge {
+  position: absolute; top: 8px; right: 8px;
+  background: rgba(229,9,20,.92); color: #fff;
+  font-size: .7rem; font-weight: 700; padding: 3px 8px; border-radius: 6px;
+}
+.video-card .play-overlay {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,.35); opacity: 0; transition: .2s;
+}
+.video-card:hover .play-overlay { opacity: 1; }
+.video-card .play-overlay span {
+  width: 44px; height: 44px; border-radius: 50%;
+  background: var(--accent); display: flex; align-items: center; justify-content: center;
+  font-size: 16px; box-shadow: 0 6px 20px rgba(0,0,0,.4);
+}
+.video-card .info { padding: 10px 11px 12px; }
+.video-card .title {
+  font-size: .82rem; font-weight: 700;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; line-height: 1.35; min-height: 2.2em;
+}
+.video-card .meta { font-size: .72rem; color: var(--muted); margin-top: 4px; }
+
+.loading, .empty {
+  grid-column: 1 / -1; text-align: center; padding: 48px 20px; color: var(--muted);
+}
+.skeleton-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }
+.skeleton {
+  aspect-ratio: 2/3; border-radius: var(--radius);
+  background: linear-gradient(90deg, #1a1a24 25%, #242433 50%, #1a1a24 75%);
+  background-size: 200% 100%; animation: shimmer 1.2s infinite;
+}
+@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+.cats { display: flex; flex-wrap: wrap; gap: 8px; }
+.cat-chip {
+  background: var(--card); border: 1px solid var(--border);
+  padding: 8px 14px; border-radius: 999px; cursor: pointer; font-size: .86rem;
+  transition: .15s;
+}
+.cat-chip:hover, .cat-chip.active {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+
+.player-wrap { max-width: 1000px; margin: 0 auto; }
+.player-top {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap;
+}
+.player-top h1 { font-size: 1.25rem; flex: 1; font-weight: 800; }
+.player-frame-wrap {
+  position: relative; width: 100%; padding-top: 56.25%;
+  background: #000; border-radius: 16px; overflow: hidden;
+  border: 1px solid var(--border); box-shadow: var(--shadow);
+}
+.player-frame-wrap iframe, #directVideo {
+  position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000;
+}
+.player-placeholder {
+  position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  background: #111; color: var(--muted); font-size: 1.05rem; gap: 12px; padding: 20px; text-align: center;
+}
+.player-placeholder .retry-btn {
+  background: var(--accent); border: none; color: #fff; padding: 10px 18px;
+  border-radius: 10px; cursor: pointer; font-weight: 700; margin-top: 8px;
+}
+.direct-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.servers-bar {
+  display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap;
+}
+.servers-label { color: var(--muted); font-size: .88rem; }
+.servers-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.server-btn {
+  background: var(--card); border: 1px solid var(--border); color: var(--text);
+  padding: 8px 13px; border-radius: 10px; cursor: pointer; font-size: .84rem; transition: .15s;
+}
+.server-btn:hover { border-color: var(--accent); }
+.server-btn.active, .server-btn.accent {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.meta-row { margin-top: 12px; color: var(--muted); font-size: .9rem; }
+
+.episodes-box, .downloads-box, .m3u8-box, .related {
+  margin-top: 22px; background: var(--surface); border-radius: 16px;
+  padding: 16px; border: 1px solid var(--border);
+}
+.episodes-box h3, .downloads-box h3, .m3u8-box h3, .related h3 {
+  margin-bottom: 12px; font-size: 1rem;
+}
+.episodes-list {
+  display: flex; flex-wrap: wrap; gap: 8px; max-height: 220px; overflow-y: auto;
+}
+.ep-btn {
+  background: var(--card); border: 1px solid var(--border); color: var(--text);
+  padding: 8px 12px; border-radius: 10px; cursor: pointer; font-size: .82rem;
+  min-width: 92px; text-align: center;
+}
+.ep-btn:hover { border-color: var(--accent); }
+.ep-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+#downloadsList a, #m3u8List a {
+  display: inline-block; background: var(--card); border: 1px solid var(--border);
+  color: #8ec7ff; padding: 8px 12px; border-radius: 8px; margin: 4px;
+  text-decoration: none; font-size: .84rem;
+}
+
+.footer {
+  border-top: 1px solid var(--border); padding: 14px 0; background: var(--surface);
+  font-size: .84rem; color: var(--muted);
+}
+.footer .container { display: flex; justify-content: space-between; align-items: center; }
+.status { padding: 3px 10px; border-radius: 999px; font-size: .75rem; }
+.status.online { background: rgba(46,204,113,.15); color: #2ecc71; }
+.status.offline { background: rgba(229,9,20,.15); color: var(--accent); }
+
+.toast {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  background: var(--card); border: 1px solid var(--border); padding: 12px 20px;
+  border-radius: 12px; box-shadow: var(--shadow); z-index: 200; transition: opacity .3s;
+  max-width: 90vw; text-align: center;
+}
+.toast.hidden { opacity: 0; pointer-events: none; }
+.toast.error { border-color: var(--accent); }
+
+@media (max-width: 640px) {
+  .video-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; }
+  .server-config input { width: 110px; }
+  .player-top h1 { font-size: 1rem; }
+}
+`;
+
+const EMBEDDED_JS = `const DEFAULT_API = window.location.origin;
+let API_BASE = localStorage.getItem('laroza_api') || DEFAULT_API;
+const LAROZA_CDN = 'https://laroza1.lat';
+
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+let hlsInstance = null;
+let currentVideo = null;
+let currentVidId = null;
+let openVideoAbort = null;
+
+async function api(path, options = {}) {
+  const ctrl = new AbortController();
+  const timeoutMs = options.timeoutMs || 55000;
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(API_BASE.replace(/\\/$/, '') + path, {
+      ...options,
+      signal: ctrl.signal,
+      headers: { Accept: 'application/json', ...(options.headers || {}) }
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      const e = new Error(err.error || ('HTTP ' + res.status));
+      e.status = res.status;
+      e.payload = err;
+      throw e;
+    }
+    return res.json();
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      const e = new Error('انتهت مهلة الطلب – السيرفر بطيء أو Cloudflare بيؤخر');
+      e.code = 'TIMEOUT';
+      throw e;
+    }
+    throw err;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function toast(msg, ms = 3200, isError = false) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.classList.toggle('error', !!isError);
+  el.classList.remove('hidden');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.add('hidden'), ms);
+}
+
+function setStatus(online) {
+  const el = $('#apiStatus');
+  el.textContent = online ? 'متصل' : 'غير متصل';
+  el.className = 'status ' + (online ? 'online' : 'offline');
+}
+
+function hideAll() {
+  ['homeSection', 'searchSection', 'catSection', 'playerSection'].forEach(id => {
+    const el = $('#' + id); if (el) el.classList.add('hidden');
+  });
+}
+function goHome() {
+  stopDirectPlayer();
+  if (openVideoAbort) { try { openVideoAbort.abort(); } catch {} }
+  hideAll();
+  $('#homeSection').classList.remove('hidden');
+  history.replaceState(null, '', '#');
+}
+function showSearch(q) {
+  hideAll();
+  $('#searchSection').classList.remove('hidden');
+  $('#searchQuery').textContent = q;
+}
+function showCat(name) {
+  hideAll();
+  $('#catSection').classList.remove('hidden');
+  $('#catTitle').textContent = name;
+}
+function showPlayer() {
+  hideAll();
+  $('#playerSection').classList.remove('hidden');
+}
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
+  );
+}
+
+function thumbUrl(v) {
+  if (v.thumbnail && /^https?:\\/\\//.test(v.thumbnail)) return v.thumbnail;
+  if (v.thumb && /^https?:\\/\\//.test(v.thumb)) return v.thumb;
+  if (v.vid) return LAROZA_CDN + '/uploads/thumbs/' + v.vid + '-1.jpg';
+  return '';
+}
+
+function placeholderThumb() {
+  return 'data:image/svg+xml,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="450"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#1a1a24"/><stop offset="1" stop-color="#2a2a38"/></linearGradient></defs><rect fill="url(#g)" width="300" height="450"/><text x="150" y="230" fill="#666" font-size="16" text-anchor="middle" font-family="Arial">Laroza</text></svg>'
+  );
+}
+
+function isEpisodeTitle(title) {
+  return /الحلقة|حلقه|Episode/i.test(title || '');
+}
+
+function videoCard(v) {
+  const title = v.title || v.vid || 'بدون عنوان';
+  const thumb = thumbUrl(v) || placeholderThumb();
+  const year = v.year || '';
+  const badge = isEpisodeTitle(title) ? '<span class="badge">حلقة</span>' : (year ? '<span class="badge">' + escapeHtml(year) + '</span>' : '');
+  return \`
+    <div class="video-card" onclick="openVideo('\${escapeHtml(v.vid)}')">
+      <div class="thumb-wrap">
+        <img class="thumb" src="\${escapeHtml(thumb)}" alt="" loading="lazy"
+          onerror="this.onerror=null;this.src='\${placeholderThumb()}'">
+        \${badge}
+        <div class="play-overlay"><span>▶</span></div>
+      </div>
+      <div class="info">
+        <div class="title">\${escapeHtml(title)}</div>
+        <div class="meta">\${escapeHtml(v.duration || '')}</div>
+      </div>
+    </div>\`;
+}
+
+function renderGrid(el, videos) {
+  if (!videos || !videos.length) {
+    el.innerHTML = '<div class="empty">لا توجد نتائج</div>';
+    return;
+  }
+  el.innerHTML = videos.map(videoCard).join('');
+}
+
+function skeletons(el, n = 12) {
+  el.innerHTML = '<div class="skeleton-grid">' + Array.from({length:n}).map(()=>'<div class="skeleton"></div>').join('') + '</div>';
+}
+
+async function checkHealth() {
+  try {
+    await api('/health', { timeoutMs: 12000 });
+    setStatus(true);
+    return true;
+  } catch {
+    setStatus(false);
+    return false;
+  }
+}
+
+async function loadHome(force = false) {
+  const grid = $('#homeGrid');
+  skeletons(grid, 12);
+  try {
+    let videos = [];
+    if (!force) {
+      try {
+        const stored = await api('/api/videos?limit=48', { timeoutMs: 15000 });
+        videos = stored.videos || [];
+      } catch {}
+    }
+    if (!videos.length || force) {
+      const home = await api('/api/scrape/home?limit=36&queue=0', { timeoutMs: 45000 });
+      videos = home.videos || [];
+    }
+    renderGrid(grid, videos);
+  } catch (e) {
+    grid.innerHTML = '<div class="empty">فشل التحميل: ' + escapeHtml(e.message) + '<br><button class="btn-outline" style="margin-top:12px" onclick="loadHome(true)">إعادة المحاولة</button></div>';
+    toast('خطأ في الاتصال بالسيرفر', 3500, true);
+  }
+}
+
+async function loadCategories() {
+  const box = $('#categories');
+  try {
+    const cats = await api('/api/categories', { timeoutMs: 10000 });
+    box.innerHTML = Object.entries(cats).map(([key, info]) =>
+      '<span class="cat-chip" onclick="openCategory(\\'' + key + '\\', \\'' + escapeHtml(info.name) + '\\')">' + escapeHtml(info.name) + '</span>'
+    ).join('');
+  } catch {
+    box.innerHTML = '';
+  }
+}
+
+async function doSearch() {
+  const q = $('#searchInput').value.trim();
+  if (!q) return;
+  showSearch(q);
+  const grid = $('#searchGrid');
+  skeletons(grid, 10);
+  try {
+    let results = [];
+    try {
+      const local = await api('/api/search/local?q=' + encodeURIComponent(q), { timeoutMs: 10000 });
+      results = local.results || [];
+    } catch {}
+    if (!results.length) {
+      const live = await api('/api/scrape/search?q=' + encodeURIComponent(q), { timeoutMs: 40000 });
+      results = live.videos || [];
+    }
+    renderGrid(grid, results);
+  } catch (e) {
+    grid.innerHTML = '<div class="empty">' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+async function openCategory(catKey, name) {
+  showCat(name || catKey);
+  const grid = $('#catGrid');
+  skeletons(grid, 12);
+  try {
+    const data = await api('/api/scrape/category/' + encodeURIComponent(catKey) + '?pages=1&queue=0', { timeoutMs: 50000 });
+    renderGrid(grid, data.videos || []);
+  } catch (e) {
+    grid.innerHTML = '<div class="empty">' + escapeHtml(e.message) + '<br><button class="btn-outline" style="margin-top:12px" onclick="openCategory(\\'' + catKey + '\\',\\'' + escapeHtml(name||catKey) + '\\')">إعادة</button></div>';
+  }
+}
+
+function stopDirectPlayer() {
+  const video = $('#directVideo');
+  if (hlsInstance) { try { hlsInstance.destroy(); } catch {} hlsInstance = null; }
+  if (video) {
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    video.style.display = 'none';
+  }
+  const frame = $('#playerFrame');
+  if (frame) frame.style.display = 'block';
+}
+
+function playDirect(url, typeHint) {
+  const video = $('#directVideo');
+  const frame = $('#playerFrame');
+  const placeholder = $('#playerPlaceholder');
+  if (!video) return;
+  stopDirectPlayer();
+  frame.style.display = 'none';
+  frame.src = 'about:blank';
+  placeholder.style.display = 'none';
+  video.style.display = 'block';
+  const isHls = /\\.m3u8(\\?|$)/i.test(url) || typeHint === 'm3u8';
+  if (isHls && window.Hls && Hls.isSupported()) {
+    hlsInstance = new Hls({ enableWorker: true, backBufferLength: 90 });
+    hlsInstance.loadSource(url);
+    hlsInstance.attachMedia(video);
+    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+    hlsInstance.on(Hls.Events.ERROR, (_, data) => {
+      if (data.fatal) toast('فشل تشغيل m3u8', 3000, true);
+    });
+  } else if (video.canPlayType('application/vnd.apple.mpegurl') && isHls) {
+    video.src = url; video.play().catch(() => {});
+  } else {
+    video.src = url; video.play().catch(() => {});
+  }
+}
+
+function playServer(btn, embedUrl) {
+  $$('.server-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  stopDirectPlayer();
+  const frame = $('#playerFrame');
+  const placeholder = $('#playerPlaceholder');
+  const video = $('#directVideo');
+  if (video) video.style.display = 'none';
+  frame.style.display = 'block';
+  if (!embedUrl) {
+    frame.src = 'about:blank';
+    placeholder.style.display = 'flex';
+    placeholder.innerHTML = '<p>لا يوجد رابط</p>';
+    return;
+  }
+  placeholder.style.display = 'none';
+  frame.src = embedUrl;
+}
+
+function renderEpisodes(episodes, currentVid) {
+  const box = $('#episodesBox');
+  const list = $('#episodesList');
+  if (!episodes || !episodes.length) {
+    box.style.display = 'none';
+    return;
+  }
+  box.style.display = 'block';
+  list.innerHTML = episodes.map(ep => {
+    const active = ep.vid === currentVid ? 'active' : '';
+    const label = ep.label || ep.title || ep.vid;
+    return '<button class="ep-btn ' + active + '" onclick="openVideo(\\'' + escapeHtml(ep.vid) + '\\')">' + escapeHtml(label) + '</button>';
+  }).join('');
+}
+
+function setPlaceholder(html) {
+  const p = $('#playerPlaceholder');
+  p.style.display = 'flex';
+  p.innerHTML = html;
+}
+
+function friendlyError(err) {
+  const msg = (err && err.message) ? String(err.message) : 'خطأ غير معروف';
+  if (/timeout|مهلة|Abort/i.test(msg) || err.code === 'TIMEOUT') {
+    return 'الطلب استغرق وقت طويل (Cloudflare أو السيرفر بطيء). جرّب مرة أخرى أو فعّل Proxy.';
+  }
+  if (/403|429|challenge|cloudflare|CF/i.test(msg)) {
+    return 'Cloudflare حجب الطلب مؤقتاً. انتظر قليلاً أو استخدم Proxy.';
+  }
+  if (/404|Not found/i.test(msg)) return 'الفيديو غير موجود أو تم حذفه.';
+  return msg;
+}
+
+async function openVideo(vid, opts = {}) {
+  currentVidId = vid;
+  showPlayer();
+  stopDirectPlayer();
+  $('#playerTitle').textContent = 'جاري التحميل...';
+  $('#playerFrame').src = 'about:blank';
+  $('#playerFrame').style.display = 'block';
+  setPlaceholder('<p>جاري جلب السيرفرات...</p><p style="font-size:.85rem;opacity:.7">لو اتأخر = Cloudflare بيبطّئ</p>');
+  $('#serversList').innerHTML = '';
+  $('#downloadsBox').style.display = 'none';
+  $('#m3u8Box').style.display = 'none';
+  $('#relatedBox').style.display = 'none';
+  $('#episodesBox').style.display = 'none';
+  $('#playerMeta').textContent = '';
+  $('#directActions').innerHTML = '';
+  history.replaceState(null, '', '#play/' + vid);
+
+  const forceFull = !!opts.full;
+  let data = null;
+  let source = '';
+
+  try {
+    // 1) cache first
+    if (!forceFull) {
+      try {
+        data = await api('/api/video/' + encodeURIComponent(vid), { timeoutMs: 8000 });
+        if (data && data.embeds && data.embeds.length) {
+          source = 'cache';
+        } else {
+          data = null;
+        }
+      } catch {}
+    }
+
+    // 2) light scrape (play + embeds + episodes meta) – fast path
+    if (!data) {
+      setPlaceholder('<p>جاري السحب السريع للسيرفرات...</p>');
+      data = await api('/api/scrape/video-light/' + encodeURIComponent(vid), { timeoutMs: 50000 });
+      source = 'light';
+    }
+
+    currentVideo = data;
+    $('#playerTitle').textContent = data.title || vid;
+
+    const parts = [];
+    if (data.duration) parts.push(data.duration);
+    if (data.year) parts.push(data.year);
+    if (data.embeds) parts.push((data.embeds.length || 0) + ' سيرفر');
+    if (data.episodes && data.episodes.length) parts.push(data.episodes.length + ' حلقة');
+    if (source) parts.push(source === 'cache' ? 'من الكاش' : 'مباشر');
+    $('#playerMeta').textContent = parts.join(' • ');
+
+    const list = $('#serversList');
+    if (data.embeds && data.embeds.length) {
+      list.innerHTML = data.embeds.map((s, i) =>
+        '<button class="server-btn ' + (i === 0 ? 'active' : '') + '" onclick="playServer(this, \\'' + escapeHtml(s.url) + '\\')">سيرفر ' + (s.id || (i + 1)) + '</button>'
+      ).join('');
+      playServer(list.querySelector('.server-btn'), data.embeds[0].url);
+    } else {
+      list.innerHTML = '<span style="color:var(--muted)">لا توجد سيرفرات</span>';
+      setPlaceholder('<p>لا توجد سيرفرات متاحة لهذا الفيديو</p><button class="retry-btn" onclick="openVideo(\\'' + escapeHtml(vid) + '\\',{full:true})">إعادة بمحاولة كاملة</button>');
+    }
+
+    renderEpisodes(data.episodes || [], vid);
+
+    if (data.downloads && data.downloads.length) {
+      $('#downloadsBox').style.display = 'block';
+      $('#downloadsList').innerHTML = data.downloads.map(d =>
+        '<a href="' + escapeHtml(d.url) + '" target="_blank" rel="noopener">' + escapeHtml(d.host || 'تحميل') + '</a>'
+      ).join('');
+    }
+
+    const directs = [];
+    (data.m3u8Probes || []).forEach(p => {
+      if (p.m3u8) directs.push({ url: p.m3u8, type: 'm3u8', label: 'm3u8' });
+      if (p.mp4) directs.push({ url: p.mp4, type: 'mp4', label: 'mp4' });
+      (p.sources || []).forEach(s => {
+        if (s && s !== p.m3u8 && s !== p.mp4) {
+          const t = /\\.m3u8/i.test(s) ? 'm3u8' : (/\\.mp4/i.test(s) ? 'mp4' : 'src');
+          directs.push({ url: s, type: t, label: t });
+        }
+      });
+    });
+    const seen = new Set();
+    const unique = directs.filter(d => { if (seen.has(d.url)) return false; seen.add(d.url); return true; });
+    if (unique.length) {
+      $('#m3u8Box').style.display = 'block';
+      $('#m3u8List').innerHTML = unique.map((d) =>
+        '<a href="' + escapeHtml(d.url) + '" target="_blank">' + d.label + '</a> ' +
+        '<button class="server-btn" onclick="playDirect(\\'' + escapeHtml(d.url) + '\\', \\'' + d.type + '\\')">▶ تشغيل</button>'
+      ).join('');
+      $('#directActions').innerHTML = unique.slice(0, 3).map(d =>
+        '<button class="server-btn accent" onclick="playDirect(\\'' + escapeHtml(d.url) + '\\', \\'' + d.type + '\\')">▶ ' + d.label + ' مباشر</button>'
+      ).join('');
+    }
+
+    if (data.related && data.related.length) {
+      $('#relatedBox').style.display = 'block';
+      renderGrid($('#relatedGrid'), data.related);
+    }
+
+    // optional background full enrich (downloads + m3u8) without blocking UI
+    if (source === 'light' && !forceFull) {
+      api('/api/scrape/video/' + encodeURIComponent(vid) + '?maxProbe=2&downloads=1', { timeoutMs: 90000 })
+        .then(full => {
+          if (currentVidId !== vid) return;
+          if (full.downloads && full.downloads.length) {
+            $('#downloadsBox').style.display = 'block';
+            $('#downloadsList').innerHTML = full.downloads.map(d =>
+              '<a href="' + escapeHtml(d.url) + '" target="_blank" rel="noopener">' + escapeHtml(d.host || 'تحميل') + '</a>'
+            ).join('');
+          }
+          // merge m3u8 if any
+          const more = [];
+          (full.m3u8Probes || []).forEach(p => {
+            if (p.m3u8) more.push({ url: p.m3u8, type: 'm3u8', label: 'm3u8' });
+            if (p.mp4) more.push({ url: p.mp4, type: 'mp4', label: 'mp4' });
+          });
+          if (more.length) {
+            const seen2 = new Set(unique.map(u => u.url));
+            const add = more.filter(m => !seen2.has(m.url));
+            if (add.length) {
+              $('#m3u8Box').style.display = 'block';
+              const extra = add.map(d =>
+                '<a href="' + escapeHtml(d.url) + '" target="_blank">' + d.label + '</a> ' +
+                '<button class="server-btn" onclick="playDirect(\\'' + escapeHtml(d.url) + '\\', \\'' + d.type + '\\')">▶ تشغيل</button>'
+              ).join('');
+              $('#m3u8List').innerHTML = ($('#m3u8List').innerHTML || '') + extra;
+            }
+          }
+        })
+        .catch(() => {});
+    }
+  } catch (e) {
+    const nice = friendlyError(e);
+    $('#playerTitle').textContent = 'فشل التحميل';
+    $('#playerMeta').textContent = nice;
+    setPlaceholder(
+      '<p>' + escapeHtml(nice) + '</p>' +
+      '<button class="retry-btn" onclick="openVideo(\\'' + escapeHtml(vid) + '\\')">إعادة المحاولة</button> ' +
+      '<button class="retry-btn" style="background:#333;margin-right:8px" onclick="openVideo(\\'' + escapeHtml(vid) + '\\',{full:true})">محاولة كاملة</button>'
+    );
+    toast(nice, 4500, true);
+  }
+}
+
+function saveApiBase() {
+  const val = $('#apiBase').value.trim().replace(/\\/$/, '');
+  if (!val) return toast('اكتب رابط السيرفر', 2500, true);
+  API_BASE = val;
+  localStorage.setItem('laroza_api', val);
+  toast('تم الحفظ');
+  checkHealth().then(ok => { if (ok) { loadHome(true); loadCategories(); } });
+}
+
+function initApiBaseInput() {
+  $('#apiBase').value = API_BASE;
+  $('#apiBase').addEventListener('keydown', e => { if (e.key === 'Enter') saveApiBase(); });
+  $('#searchInput').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
+}
+
+async function boot() {
+  initApiBaseInput();
+  const hash = location.hash || '';
+  if (hash.startsWith('#play/')) {
+    const vid = hash.replace('#play/', '');
+    if (vid) {
+      await checkHealth();
+      openVideo(vid);
+      loadCategories();
+      return;
+    }
+  }
+  const ok = await checkHealth();
+  if (ok) await Promise.all([loadHome(), loadCategories()]);
+  else {
+    $('#homeGrid').innerHTML = '<div class="empty">السيرفر غير متصل<br><small>ضع رابط الـ API ثم احفظ</small></div>';
+  }
+}
+boot();
+`;
 
 // ============================================================================
 // UTILITIES
@@ -153,7 +973,7 @@ function randomItem(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-function randomDelay(min = 400, max = 1200) {
+function randomDelay(min = 300, max = 900) {
   return sleep(min + Math.floor(Math.random() * (max - min)));
 }
 
@@ -184,14 +1004,6 @@ function nowISO() {
   return new Date().toISOString();
 }
 
-function formatBytes(bytes) {
-  if (!bytes || bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
-
 function isCloudflareChallenge(html, status) {
   if (status === 403 || status === 503) return true;
   if (!html) return false;
@@ -202,7 +1014,8 @@ function isCloudflareChallenge(html, status) {
     'Just a moment',
     'cf-challenge',
     'challenge-platform',
-    'Attention Required! | Cloudflare'
+    'Attention Required! | Cloudflare',
+    'Enable JavaScript and cookies'
   ];
   return markers.some(m => html.includes(m));
 }
@@ -214,6 +1027,33 @@ const Logger = {
   debug: (...a) => { if (process.env.DEBUG === '1') console.log(`[${nowISO()}] [DEBUG]`, ...a); },
   success: (...a) => console.log(`[${nowISO()}] [OK]`, ...a)
 };
+
+// ============================================================================
+// SIMPLE MEMORY CACHE (play / embeds)
+// ============================================================================
+
+class MemoryCache {
+  constructor(ttlMs = CONFIG.MEMORY_CACHE_TTL_MS) {
+    this.ttl = ttlMs;
+    this.map = new Map();
+  }
+
+  get(key) {
+    const e = this.map.get(key);
+    if (!e) return null;
+    if (Date.now() > e.exp) {
+      this.map.delete(key);
+      return null;
+    }
+    return e.val;
+  }
+
+  set(key, val, ttl) {
+    this.map.set(key, { val, exp: Date.now() + (ttl || this.ttl) });
+  }
+
+  del(key) { this.map.delete(key); }
+}
 
 // ============================================================================
 // PROXY MANAGER
@@ -232,6 +1072,8 @@ class ProxyManager {
     this.proxies = [...new Set(this.proxies.filter(Boolean))];
     if (this.proxies.length) {
       Logger.info(`Loaded ${this.proxies.length} proxy(ies)`);
+    } else {
+      Logger.warn('No proxy configured – Cloudflare will rate-limit Railway IP hard');
     }
   }
 
@@ -269,7 +1111,7 @@ class ProxyManager {
 }
 
 // ============================================================================
-// HTTP CLIENT (retry + proxy + CF-aware)
+// HTTP CLIENT (retry + proxy + CF-aware) – FIXED
 // ============================================================================
 
 class HttpClient {
@@ -281,6 +1123,7 @@ class HttpClient {
     this.lastRequestTime = 0;
     this.proxyManager = new ProxyManager();
     this.cfBlockedUntil = 0;
+    this.cfHits = 0;
   }
 
   pickUA() {
@@ -326,13 +1169,19 @@ class HttpClient {
     }
   }
 
+  clearCfCookies() {
+    delete this.cookies['cf_clearance'];
+    delete this.cookies['__cf_bm'];
+    delete this.cookies['cf_chl_2'];
+  }
+
   request(targetUrl, options = {}) {
     return new Promise(async (resolve, reject) => {
       await this.throttle();
 
       if (Date.now() < this.cfBlockedUntil) {
         const wait = this.cfBlockedUntil - Date.now();
-        Logger.warn(`CF cooldown active, waiting ${Math.round(wait/1000)}s`);
+        Logger.warn(`CF cooldown active, waiting ${Math.round(wait / 1000)}s`);
         await sleep(wait);
       }
 
@@ -410,19 +1259,26 @@ class HttpClient {
         const res = await this.request(targetUrl, options);
 
         if (isCloudflareChallenge(res.body, res.status)) {
+          this.cfHits++;
           Logger.warn(`Cloudflare challenge detected (attempt ${attempt}) on ${targetUrl}`);
-          this.cfBlockedUntil = Date.now() + (15000 * attempt);
-          // Clear some cookies that might be poisoned
-          delete this.cookies['cf_clearance'];
-          await sleep(this.retryDelay * attempt * 1.8);
+          this.clearCfCookies();
+          // Much milder cooldown than v2.1 (was 15s * attempt)
+          const cool = Math.min(8000 + (2500 * attempt) + (this.cfHits * 500), 25000);
+          this.cfBlockedUntil = Date.now() + cool;
+          await sleep(this.retryDelay * attempt);
           continue;
         }
 
-        if (res.status >= 200 && res.status < 400) return res;
+        if (res.status >= 200 && res.status < 400) {
+          // success path – slowly decay cfHits
+          if (this.cfHits > 0) this.cfHits = Math.max(0, this.cfHits - 1);
+          return res;
+        }
 
         if (res.status === 403 || res.status === 429) {
           Logger.warn(`HTTP ${res.status} – attempt ${attempt}`);
-          await sleep(this.retryDelay * attempt * 1.6);
+          this.clearCfCookies();
+          await sleep(this.retryDelay * attempt * 1.4);
           continue;
         }
         if (res.status >= 500) {
@@ -451,7 +1307,6 @@ class HttpClient {
     }));
   }
 
-  // Lightweight HEAD / small GET to probe for m3u8
   async probe(url, options = {}) {
     try {
       const res = await this.request(url, Object.assign({
@@ -515,17 +1370,14 @@ class HtmlParser {
     const seen = new Set();
     const thumbByVid = {};
 
-    // Map thumbs near vid references
     const thumbRe = /uploads\/thumbs\/([a-zA-Z0-9_-]+)-1\.(?:jpg|jpeg|png|webp)[^"'\s]*/gi;
     let tm;
     while ((tm = thumbRe.exec(this.html)) !== null) {
       const id = tm[1];
       const full = tm[0].startsWith('http') ? tm[0] : (CONFIG.BASE_URL + '/' + tm[0].replace(/^\//, ''));
-      // clean query is ok to keep
       if (!thumbByVid[id]) thumbByVid[id] = full.split('"')[0].split("'")[0];
     }
 
-    // Also img src absolute
     const imgRe = /(?:src|data-src)=["']([^"']*uploads\/thumbs\/[^"']+)["']/gi;
     while ((tm = imgRe.exec(this.html)) !== null) {
       const src = tm[1];
@@ -552,7 +1404,6 @@ class HtmlParser {
       });
     }
 
-    // Enrich empty titles from nearby context
     for (const v of videos) {
       if (!v.title) {
         const idx = this.html.indexOf('vid=' + v.vid);
@@ -563,7 +1414,6 @@ class HtmlParser {
                            around.match(/<strong[^>]*>([^<]{5,110})<\/strong>/i);
         if (titleMatch) v.title = cleanText(titleMatch[1]);
       }
-      // Prefer alt-associated thumb if better
       if (thumbByVid[v.vid]) v.thumbnail = thumbByVid[v.vid];
     }
 
@@ -596,7 +1446,6 @@ class HtmlParser {
       let inner = cleanText(m[3].replace(/<[^>]+>/g, ' '));
       if (!inner || inner.length > 60) continue;
       if (/var |function|MELODY|document\.|\{|\}/.test(inner)) continue;
-      // Accept "الحلقة 12", "12 حلقة", "الحلقة السابقة 11", etc.
       const isEp = /(?:الحلقة|حلقه)\s*\d+|\d+\s*(?:حلقة|حلقه)|Episode\s*\d+/i.test(inner);
       if (!isEp) continue;
       if (seen.has(vid)) continue;
@@ -640,7 +1489,6 @@ class HtmlParser {
       }
     }
 
-    // Also try data-src patterns
     const dataSrcRe = /data-(?:src|url|embed|file)=["'](https?:\/\/[^"']+)["']/gi;
     while ((m = dataSrcRe.exec(this.html)) !== null) {
       if (!servers.find(s => s.url === m[1])) {
@@ -753,10 +1601,6 @@ class StreamProber {
     } catch { return false; }
   }
 
-  /**
-   * Try to discover direct m3u8 or mp4 links from an embed page.
-   * This is best-effort and host-specific heuristics.
-   */
   async probeEmbed(embedUrl) {
     const result = {
       embedUrl,
@@ -781,19 +1625,15 @@ class StreamProber {
 
       const html = res.body || '';
 
-      // Generic m3u8 regex
       const m3u8Matches = html.match(/https?:\/\/[^"'\\\s<>]+?\.m3u8[^"'\\\s<>]*/gi) || [];
       const uniqueM3u8 = [...new Set(m3u8Matches.map(u => u.replace(/\\+/g, '')))];
 
-      // Generic mp4
       const mp4Matches = html.match(/https?:\/\/[^"'\\\s<>]+?\.mp4[^"'\\\s<>]*/gi) || [];
       const uniqueMp4 = [...new Set(mp4Matches.map(u => u.replace(/\\+/g, '')))];
 
-      // Common player config patterns (jwplayer, videojs, clappr, etc.)
       const fileMatch = html.match(/(?:file|source|src|sources)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i);
       if (fileMatch) result.sources.push(fileMatch[1]);
 
-      // Additional patterns: jwplayer setup, videojs, packed links
       const extraRe = [
         /["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/gi,
         /file\s*:\s*["']([^"']+)["']/gi,
@@ -839,7 +1679,7 @@ class StreamProber {
     return result;
   }
 
-  async probeMany(embedUrls, limit = 6) {
+  async probeMany(embedUrls, limit = 4) {
     const results = [];
     const list = (embedUrls || []).slice(0, limit);
     for (const u of list) {
@@ -849,7 +1689,7 @@ class StreamProber {
       }
       const r = await this.probeEmbed(u);
       results.push(r);
-      await randomDelay(500, 1100);
+      await randomDelay(400, 900);
     }
     return results;
   }
@@ -929,7 +1769,10 @@ class DataStore {
   getVideo(vid) { return this.videos.get(vid) || null; }
 
   getAllVideos(limit = 500) {
-    return Array.from(this.videos.values()).slice(0, limit);
+    const arr = Array.from(this.videos.values());
+    // newest first roughly
+    arr.sort((a, b) => String(b.updatedAt || b.scrapedAt || '').localeCompare(String(a.updatedAt || a.scrapedAt || '')));
+    return arr.slice(0, limit);
   }
 
   searchLocal(q, limit = 50) {
@@ -967,6 +1810,7 @@ class LarozaScraper extends EventEmitter {
     this.store = store || new DataStore();
     this.client = client || new HttpClient();
     this.prober = new StreamProber(this.client);
+    this.memCache = new MemoryCache();
     this.queue = [];
     this.running = false;
     this.visited = new Set();
@@ -1016,6 +1860,10 @@ class LarozaScraper extends EventEmitter {
   }
 
   async fetchVideoPage(vid) {
+    const cacheKey = 'videoPage:' + vid;
+    const cached = this.memCache.get(cacheKey);
+    if (cached) return cached;
+
     const target = `${CONFIG.BASE_URL}/video.php?vid=${encodeURIComponent(vid)}`;
     const res = await this.client.get(target);
     const parser = new HtmlParser(res.body);
@@ -1031,7 +1879,7 @@ class LarozaScraper extends EventEmitter {
 
     const episodes = parser.extractEpisodes();
 
-    return {
+    const out = {
       vid,
       playVid,
       playUrl,
@@ -1040,9 +1888,15 @@ class LarozaScraper extends EventEmitter {
       related: cards.filter(c => c.vid !== vid).slice(0, 12),
       rawLength: res.body.length
     };
+    this.memCache.set(cacheKey, out, 1000 * 60 * 8);
+    return out;
   }
 
   async fetchPlayPage(vid) {
+    const cacheKey = 'playPage:' + vid;
+    const cached = this.memCache.get(cacheKey);
+    if (cached) return cached;
+
     const target = `${CONFIG.BASE_URL}/play.php?vid=${encodeURIComponent(vid)}`;
     const res = await this.client.get(target);
     const parser = new HtmlParser(res.body);
@@ -1053,7 +1907,7 @@ class LarozaScraper extends EventEmitter {
     const iframeMatch = res.body.match(/<iframe[^>]+src=["']([^"']+)["']/i);
     const currentEmbed = iframeMatch ? iframeMatch[1] : (embeds[0] ? embeds[0].url : null);
 
-    return {
+    const out = {
       vid,
       meta,
       embeds,
@@ -1061,6 +1915,8 @@ class LarozaScraper extends EventEmitter {
       related,
       downloadPage: `${CONFIG.BASE_URL}/download.php?vid=${vid}`
     };
+    this.memCache.set(cacheKey, out, CONFIG.MEMORY_CACHE_TTL_MS);
+    return out;
   }
 
   async fetchDownloadPage(vid) {
@@ -1085,21 +1941,67 @@ class LarozaScraper extends EventEmitter {
     };
   }
 
+  /**
+   * LIGHT path – only video page + play page (embeds + episodes).
+   * No download page, no m3u8 probe. Much faster under CF pressure.
+   */
+  async scrapeVideoLight(vid) {
+    Logger.info(`Light scrape: ${vid}`);
+
+    try {
+      const videoPage = await this.fetchVideoPage(vid);
+      await randomDelay(200, 500);
+      const playPage = await this.fetchPlayPage(videoPage.playVid || vid);
+
+      const record = {
+        vid: videoPage.vid,
+        playVid: videoPage.playVid,
+        title: playPage.meta.title || videoPage.meta.title,
+        description: playPage.meta.description || videoPage.meta.description,
+        thumbnail: playPage.meta.thumbnail || videoPage.meta.thumbnail ||
+          (CONFIG.BASE_URL + '/uploads/thumbs/' + videoPage.vid + '-1.jpg'),
+        duration: playPage.meta.duration || videoPage.meta.duration,
+        year: playPage.meta.year || videoPage.meta.year,
+        embeds: playPage.embeds || [],
+        currentEmbed: playPage.currentEmbed,
+        downloads: [],
+        m3u8Probes: [],
+        episodes: videoPage.episodes || [],
+        related: (videoPage.related || []).map(r => Object.assign({}, r, {
+          thumbnail: r.thumbnail || (CONFIG.BASE_URL + '/uploads/thumbs/' + r.vid + '-1.jpg')
+        })),
+        playUrl: videoPage.playUrl,
+        sourceUrl: `${CONFIG.BASE_URL}/video.php?vid=${vid}`,
+        scrapedAt: nowISO(),
+        light: true
+      };
+
+      this.store.upsertVideo(vid, record);
+      this.emit('video', record);
+      Logger.success(`Light ${vid} → embeds:${record.embeds.length} episodes:${record.episodes.length}`);
+      return record;
+    } catch (err) {
+      this.store.stats.errors++;
+      Logger.error(`Light scrape failed ${vid}:`, err.message);
+      throw err;
+    }
+  }
+
   async scrapeFullVideo(vid, opts = {}) {
     const {
       includeDownloads = true,
       probeM3u8 = true,
-      maxProbe = 5
+      maxProbe = 3
     } = opts;
 
-    Logger.info(`Scraping full video: ${vid}`);
+    Logger.info(`Full scrape: ${vid}`);
 
     try {
       const videoPage = await this.fetchVideoPage(vid);
-      await randomDelay(300, 700);
+      await randomDelay(250, 550);
 
       const playPage = await this.fetchPlayPage(videoPage.playVid || vid);
-      await randomDelay(300, 700);
+      await randomDelay(250, 550);
 
       let downloads = [];
       if (includeDownloads) {
@@ -1126,7 +2028,8 @@ class LarozaScraper extends EventEmitter {
         playVid: videoPage.playVid,
         title: playPage.meta.title || videoPage.meta.title,
         description: playPage.meta.description || videoPage.meta.description,
-        thumbnail: playPage.meta.thumbnail || videoPage.meta.thumbnail || (CONFIG.BASE_URL + '/uploads/thumbs/' + videoPage.vid + '-1.jpg'),
+        thumbnail: playPage.meta.thumbnail || videoPage.meta.thumbnail ||
+          (CONFIG.BASE_URL + '/uploads/thumbs/' + videoPage.vid + '-1.jpg'),
         duration: playPage.meta.duration || videoPage.meta.duration,
         year: playPage.meta.year || videoPage.meta.year,
         embeds: playPage.embeds,
@@ -1139,12 +2042,13 @@ class LarozaScraper extends EventEmitter {
         })),
         playUrl: videoPage.playUrl,
         sourceUrl: `${CONFIG.BASE_URL}/video.php?vid=${vid}`,
-        scrapedAt: nowISO()
+        scrapedAt: nowISO(),
+        light: false
       };
 
       this.store.upsertVideo(vid, record);
       this.emit('video', record);
-      Logger.success(`Video ${vid} → embeds:${record.embeds.length} downloads:${downloads.length} m3u8:${m3u8Probes.filter(p=>p.m3u8||p.mp4).length}`);
+      Logger.success(`Full ${vid} → embeds:${record.embeds.length} downloads:${downloads.length} m3u8:${m3u8Probes.filter(p => p.m3u8 || p.mp4).length}`);
       return record;
     } catch (err) {
       this.store.stats.errors++;
@@ -1153,8 +2057,8 @@ class LarozaScraper extends EventEmitter {
     }
   }
 
-  async scrapeCategory(catKey, maxPages = 5) {
-    Logger.info(`Scraping category ${catKey} (max ${maxPages} pages)`);
+  async scrapeCategory(catKey, maxPages = 3, enqueue = false) {
+    Logger.info(`Scraping category ${catKey} (max ${maxPages} pages, enqueue=${enqueue})`);
     const allVideos = [];
     let page = 1;
     let hasMore = true;
@@ -1164,17 +2068,19 @@ class LarozaScraper extends EventEmitter {
         const result = await this.fetchCategory(catKey, page);
         allVideos.push(...result.videos);
 
-        for (const v of result.videos) {
-          if (!this.visited.has(v.vid)) {
-            this.visited.add(v.vid);
-            this.queue.push({ type: 'video', vid: v.vid });
+        if (enqueue) {
+          for (const v of result.videos) {
+            if (!this.visited.has(v.vid)) {
+              this.visited.add(v.vid);
+              this.queue.push({ type: 'video', vid: v.vid });
+            }
           }
         }
 
         const maxPage = result.pagination.reduce((mx, p) => Math.max(mx, p.page), 1);
         hasMore = page < maxPage && result.videos.length > 0;
         page++;
-        await randomDelay(800, 1500);
+        await randomDelay(600, 1200);
       } catch (e) {
         Logger.error(`Category page ${page} failed:`, e.message);
         hasMore = false;
@@ -1191,12 +2097,14 @@ class LarozaScraper extends EventEmitter {
     return allVideos;
   }
 
-  async scrapeHomeAndQueue(limit = 40) {
+  async scrapeHomeAndQueue(limit = 40, enqueue = false) {
     const home = await this.fetchHome();
-    for (const v of home.videos.slice(0, limit)) {
-      if (!this.visited.has(v.vid)) {
-        this.visited.add(v.vid);
-        this.queue.push({ type: 'video', vid: v.vid });
+    if (enqueue) {
+      for (const v of home.videos.slice(0, limit)) {
+        if (!this.visited.has(v.vid)) {
+          this.visited.add(v.vid);
+          this.queue.push({ type: 'video', vid: v.vid });
+        }
       }
     }
     return home.videos;
@@ -1224,19 +2132,19 @@ class LarozaScraper extends EventEmitter {
       const job = this.queue.shift();
       if (!job) break;
       try {
-        if (job.type === 'video') await this.scrapeFullVideo(job.vid);
-        else if (job.type === 'category') await this.scrapeCategory(job.cat, job.maxPages || 3);
+        if (job.type === 'video') await this.scrapeVideoLight(job.vid);
+        else if (job.type === 'category') await this.scrapeCategory(job.cat, job.maxPages || 3, false);
       } catch (e) {
         Logger.error(`Worker ${id} failed:`, e.message);
       }
-      await randomDelay(600, 1400);
+      await randomDelay(500, 1100);
     }
   }
 
   async crawlEverything(options = {}) {
     const {
-      categories = Object.keys(CONFIG.CATEGORIES),
-      maxPagesPerCat = 3,
+      categories = Object.keys(CONFIG.CATEGORIES).slice(0, 6),
+      maxPagesPerCat = 2,
       includeHome = true,
       includeNew = true,
       includeTop = true
@@ -1244,7 +2152,7 @@ class LarozaScraper extends EventEmitter {
 
     Logger.info('=== FULL SITE CRAWL STARTED ===');
 
-    if (includeHome) await this.scrapeHomeAndQueue(50);
+    if (includeHome) await this.scrapeHomeAndQueue(30, true);
     if (includeNew) {
       const neu = await this.fetchNewVideos();
       for (const v of neu.videos) {
@@ -1315,7 +2223,6 @@ class ApiServer {
     const pathname = parsed.pathname;
     const method = req.method.toUpperCase();
 
-    // Full CORS – allow any frontend
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
@@ -1327,8 +2234,7 @@ class ApiServer {
       return;
     }
 
-    // Static files from /public
-    if (method === 'GET' && (pathname === '/' || pathname.startsWith('/public/') || 
+    if (method === 'GET' && (pathname === '/' || pathname.startsWith('/public/') ||
         pathname === '/style.css' || pathname === '/app.js' || pathname === '/index.html' ||
         pathname === '/favicon.ico')) {
       return this.serveStatic(req, res, pathname);
@@ -1354,7 +2260,13 @@ class ApiServer {
       await matched.handler(req, res);
     } catch (err) {
       Logger.error('API error:', err);
-      this.json(res, 500, { error: err.message, stack: process.env.DEBUG === '1' ? err.stack : undefined });
+      this.json(res, 500, {
+        error: err.message,
+        hint: /cloudflare|challenge|403|429|timeout/i.test(err.message)
+          ? 'CF/timeout – enable PROXY_URL or retry later'
+          : undefined,
+        stack: process.env.DEBUG === '1' ? err.stack : undefined
+      });
     }
   }
 
@@ -1368,9 +2280,7 @@ class ApiServer {
     res.end(html);
   }
 
-
   serveStatic(req, res, pathname) {
-    // Single-file mode: serve embedded frontend (no public/ folder required)
     let body = null;
     let ctype = 'text/html; charset=utf-8';
 
@@ -1401,21 +2311,21 @@ class ApiServer {
   start(port = CONFIG.PORT, host = CONFIG.HOST) {
     this.server = http.createServer((req, res) => this.handle(req, res));
     this.server.listen(port, host, () => {
-      Logger.success(`Laroza Scraper API v2.1 → http://${host}:${port}`);
-      Logger.info('Proxy enabled: ' + (this.scraper.client.proxyManager.hasProxy() ? 'YES' : 'NO'));
+      Logger.success(`Laroza Scraper API v2.2 → http://${host}:${port}`);
+      Logger.info('Proxy enabled: ' + (this.scraper.client.proxyManager.hasProxy() ? 'YES' : 'NO (add PROXY_URL!)'));
     });
   }
 }
 
 function setupRoutes(api, scraper, store) {
-  // Dashboard
-  api.get('/', async (req, res) => {
+  // Admin dashboard (simple)
+  api.get('/admin', async (req, res) => {
     const html = `<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Laroza Scraper v2.1</title>
+<title>Laroza Scraper v2.2</title>
 <style>
 :root{--bg:#0b0b0f;--card:#15151c;--accent:#ff3b5c;--text:#e8e8ed;--muted:#9a9aad}
 *{box-sizing:border-box}
@@ -1428,21 +2338,19 @@ h1{color:var(--accent);margin:0 0 8px}
 .stat{background:#1c1c26;border-radius:10px;padding:14px;text-align:center}
 .stat b{display:block;font-size:1.4rem;color:var(--accent)}
 a{color:#7eb6ff;text-decoration:none}
-a:hover{text-decoration:underline}
 code{background:#222;padding:2px 7px;border-radius:4px;font-size:.9em}
 ul{padding-right:18px}
 .btn{display:inline-block;background:var(--accent);color:#fff;padding:8px 14px;border-radius:8px;margin:4px 4px 4px 0;font-size:.9rem}
-input,select{background:#1c1c26;border:1px solid #333;color:var(--text);padding:8px 12px;border-radius:8px;width:100%;max-width:320px}
+input{background:#1c1c26;border:1px solid #333;color:var(--text);padding:8px 12px;border-radius:8px;width:100%;max-width:320px}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>Laroza1.lat Scraper <small style="font-size:.6em;color:var(--muted)">v2.1</small></h1>
+  <h1>Laroza1.lat Scraper <small style="font-size:.6em;color:var(--muted)">v2.2 FIXED</small></h1>
   <p class="sub">سحب الأفلام • المسلسلات • السيرفرات • روابط التحميل • m3u8</p>
-
   <div class="card">
     <div class="grid">
-      <div class="stat"><b id="vcount">${store.stats.totalVideos}</b> فيديو</div>
+      <div class="stat"><b>${store.stats.totalVideos}</b> فيديو</div>
       <div class="stat"><b>${store.stats.totalEmbeds}</b> سيرفر</div>
       <div class="stat"><b>${store.stats.totalDownloads}</b> تحميل</div>
       <div class="stat"><b>${store.stats.totalM3u8 || 0}</b> m3u8</div>
@@ -1450,42 +2358,29 @@ input,select{background:#1c1c26;border:1px solid #333;color:var(--text);padding:
     </div>
     <p style="margin-top:14px;color:var(--muted);font-size:.9rem">
       آخر زحف: ${store.stats.lastCrawl || 'لم يتم بعد'} |
-      البروكسي: ${scraper.client.proxyManager.hasProxy() ? 'مفعّل' : 'غير مفعّل'}
+      البروكسي: ${scraper.client.proxyManager.hasProxy() ? 'مفعّل' : 'غير مفعّل – ضروري ضد CF'}
     </p>
   </div>
-
   <div class="card">
     <h3>اختبار سريع</h3>
     <p>
-      <input type="text" id="vidInput" placeholder="vid مثال: 8d0e6f937" value="8d0e6f937">
+      <input type="text" id="vidInput" placeholder="vid" value="85d3395d3">
+      <a class="btn" href="#" onclick="location.href='/api/scrape/video-light/'+document.getElementById('vidInput').value;return false">سحب خفيف</a>
       <a class="btn" href="#" onclick="location.href='/api/scrape/video/'+document.getElementById('vidInput').value;return false">سحب كامل</a>
-      <a class="btn" href="#" onclick="location.href='/api/scrape/play/'+document.getElementById('vidInput').value;return false">سيرفرات فقط</a>
-      <a class="btn" href="#" onclick="location.href='/api/embeds/'+document.getElementById('vidInput').value;return false">embeds</a>
+      <a class="btn" href="#" onclick="location.href='/api/scrape/play/'+document.getElementById('vidInput').value;return false">سيرفرات</a>
     </p>
   </div>
-
   <div class="card">
     <h3>Endpoints</h3>
     <ul>
-      <li><code>GET /api/stats</code></li>
-      <li><code>GET /api/videos?limit=50</code></li>
-      <li><code>GET /api/video/:vid</code></li>
-      <li><code>GET /api/scrape/video/:vid</code> – كامل (embeds + downloads + m3u8 probe)</li>
+      <li><code>GET /api/scrape/video-light/:vid</code> – سريع (embeds + حلقات) ← الافتراضي للفرونت</li>
+      <li><code>GET /api/scrape/video/:vid</code> – كامل + downloads + m3u8 probe</li>
       <li><code>GET /api/scrape/play/:vid</code></li>
-      <li><code>GET /api/scrape/download/:vid</code></li>
-      <li><code>GET /api/scrape/category/:cat?pages=3</code></li>
-      <li><code>GET /api/scrape/home</code></li>
-      <li><code>GET /api/scrape/search?q=كلمة</code></li>
-      <li><code>GET /api/scrape/full</code> – زحف كبير (حذر)</li>
-      <li><code>GET /api/export</code></li>
-      <li><code>GET /api/categories</code></li>
+      <li><code>GET /api/scrape/home?queue=0</code></li>
+      <li><code>GET /api/scrape/category/:cat?pages=1&queue=0</code></li>
+      <li><code>GET /api/video/:vid</code> – من الكاش</li>
       <li><code>GET /health</code></li>
     </ul>
-  </div>
-
-  <div class="card">
-    <h3>تصنيفات معروفة</h3>
-    <p style="font-size:.9rem;color:var(--muted)">${Object.entries(CONFIG.CATEGORIES).map(([k,v]) => `<code>${k}</code> ${v.name}`).join(' • ')}</p>
   </div>
 </div>
 </body>
@@ -1499,7 +2394,9 @@ input,select{background:#1c1c26;border:1px solid #333;color:var(--text);padding:
       queueLength: scraper.queue.length,
       visited: scraper.visited.size,
       proxyEnabled: scraper.client.proxyManager.hasProxy(),
-      categories: Object.fromEntries(store.categories)
+      cfHits: scraper.client.cfHits || 0,
+      categories: Object.fromEntries(store.categories),
+      version: '2.2.0'
     });
   });
 
@@ -1510,15 +2407,22 @@ input,select{background:#1c1c26;border:1px solid #333;color:var(--text);padding:
 
   api.get('/api/video/:vid', async (req, res) => {
     const v = store.getVideo(req.params.vid);
-    if (!v) return api.json(res, 404, { error: 'Not in store. Use /api/scrape/video/:vid' });
+    if (!v) return api.json(res, 404, { error: 'Not in store. Use /api/scrape/video-light/:vid' });
     api.json(res, 200, v);
+  });
+
+  // NEW: light path – default for player
+  api.get('/api/scrape/video-light/:vid', async (req, res) => {
+    const data = await scraper.scrapeVideoLight(req.params.vid);
+    store.save();
+    api.json(res, 200, data);
   });
 
   api.get('/api/scrape/video/:vid', async (req, res) => {
     const data = await scraper.scrapeFullVideo(req.params.vid, {
       includeDownloads: req.query.downloads !== '0',
       probeM3u8: req.query.m3u8 !== '0',
-      maxProbe: parseInt(req.query.maxProbe || '5', 10)
+      maxProbe: parseInt(req.query.maxProbe || '3', 10)
     });
     store.save();
     api.json(res, 200, data);
@@ -1535,15 +2439,17 @@ input,select{background:#1c1c26;border:1px solid #333;color:var(--text);padding:
   });
 
   api.get('/api/scrape/category/:cat', async (req, res) => {
-    const pages = parseInt(req.query.pages || '2', 10);
-    const videos = await scraper.scrapeCategory(req.params.cat, pages);
+    const pages = parseInt(req.query.pages || '1', 10);
+    const enqueue = req.query.queue === '1';
+    const videos = await scraper.scrapeCategory(req.params.cat, pages, enqueue);
     if (req.query.full === '1') await scraper.processQueue();
     store.save();
     api.json(res, 200, { category: req.params.cat, count: videos.length, videos });
   });
 
   api.get('/api/scrape/home', async (req, res) => {
-    const videos = await scraper.scrapeHomeAndQueue(parseInt(req.query.limit || '30', 10));
+    const enqueue = req.query.queue === '1';
+    const videos = await scraper.scrapeHomeAndQueue(parseInt(req.query.limit || '36', 10), enqueue);
     if (req.query.full === '1') await scraper.processQueue();
     store.save();
     api.json(res, 200, { count: videos.length, videos });
@@ -1603,7 +2509,7 @@ input,select{background:#1c1c26;border:1px solid #333;color:var(--text);padding:
 
   api.get('/api/probe/:vid', async (req, res) => {
     const play = await scraper.fetchPlayPage(req.params.vid);
-    const probes = await scraper.prober.probeMany((play.embeds || []).map(e => e.url), parseInt(req.query.limit || '6', 10));
+    const probes = await scraper.prober.probeMany((play.embeds || []).map(e => e.url), parseInt(req.query.limit || '4', 10));
     api.json(res, 200, { vid: req.params.vid, probes });
   });
 
@@ -1613,7 +2519,7 @@ input,select{background:#1c1c26;border:1px solid #333;color:var(--text);padding:
       uptime: process.uptime(),
       videos: store.stats.totalVideos,
       proxy: scraper.client.proxyManager.hasProxy(),
-      version: '2.1.0'
+      version: '2.2.0'
     });
   });
 }
@@ -1644,9 +2550,9 @@ async function main() {
   });
 
   if (process.env.AUTO_SCRAPE === '1') {
-    Logger.info('AUTO_SCRAPE enabled');
+    Logger.info('AUTO_SCRAPE enabled (light)');
     try {
-      await scraper.scrapeHomeAndQueue(12);
+      await scraper.scrapeHomeAndQueue(8, true);
       await scraper.processQueue(2);
     } catch (e) {
       Logger.error('Auto scrape failed:', e.message);
@@ -1663,6 +2569,7 @@ module.exports = {
   StreamProber,
   ProxyManager,
   ApiServer,
+  MemoryCache,
   main
 };
 
