@@ -1,6 +1,6 @@
 {
   "name": "laroza-scraper-server",
-  "version": "2.1.0",
+  "version": "1.1.0",
   "description": "Laroza1.lat scraper API + web player frontend (CORS enabled)",
   "main": "laroza-scraper-server.js",
   "scripts": {
