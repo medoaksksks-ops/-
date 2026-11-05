@@ -1,0 +1,36 @@
+{
+  "name": "laroza-scraper-server",
+  "version": "2.1.0",
+  "description": "Laroza1.lat scraper API + web player frontend (CORS enabled)",
+  "main": "laroza-scraper-server.js",
+  "scripts": {
+    "start": "node laroza-scraper-server.js",
+    "dev": "NODE_ENV=development DEBUG=1 node laroza-scraper-server.js",
+    "auto": "AUTO_SCRAPE=1 node laroza-scraper-server.js",
+    "pm2": "pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop laroza-scraper",
+    "pm2:logs": "pm2 logs laroza-scraper"
+  },
+  "keywords": [
+    "laroza",
+    "scraper",
+    "streaming",
+    "embed",
+    "m3u8",
+    "proxy"
+  ],
+  "author": "neglectedsins-research",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  },
+  "optionalDependencies": {
+    "cheerio": "^1.0.0-rc.12",
+    "https-proxy-agent": "^7.0.4",
+    "socks-proxy-agent": "^8.0.3"
+  },
+  "devDependencies": {}
+}
