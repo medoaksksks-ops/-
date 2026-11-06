@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * LAROZA SCRAPER API SERVER  v2.3
+ * LAROZA SCRAPER API SERVER  v2.3.1
  * ============================================================================
  * - API only (no embedded HTML frontend)
  * - Category: مسلسلات رمضان 2026 (ramadan-2026)
@@ -622,14 +622,31 @@ class StreamProber {
   }
 
   async probeMany(embedUrls, limit = 4) {
-    const results = [];
-    for (const u of (embedUrls || []).slice(0, limit)) {
+    const list = (embedUrls || []).slice(0, limit);
+    // Prefer known-friendly hosts first
+    const sorted = [...list].sort((a, b) => {
+      const af = this.isFriendlyHost(a) ? 0 : 1;
+      const bf = this.isFriendlyHost(b) ? 0 : 1;
+      return af - bf;
+    });
+    const tasks = sorted.map(async (u) => {
       if (!this.isFriendlyHost(u)) {
-        results.push({ embedUrl: u, skipped: true, reason: 'host not friendly' });
-        continue;
+        return { embedUrl: u, skipped: true, reason: 'host not friendly' };
       }
-      results.push(await this.probeEmbed(u));
-      await randomDelay(350, 800);
+      try {
+        return await this.probeEmbed(u);
+      } catch (e) {
+        return { embedUrl: u, error: e.message, sources: [] };
+      }
+    });
+    // parallel with mild stagger to reduce CF burst
+    const results = [];
+    const batch = 3;
+    for (let i = 0; i < tasks.length; i += batch) {
+      const chunk = tasks.slice(i, i + batch);
+      const part = await Promise.all(chunk);
+      results.push(...part);
+      if (i + batch < tasks.length) await randomDelay(200, 400);
     }
     return results;
   }
@@ -914,13 +931,22 @@ class LarozaScraper extends EventEmitter {
     return record;
   }
 
-  async resolveStreams(vid, maxProbe = 5) {
+  async resolveStreams(vid, maxProbe = 3) {
     let data = this.store.getVideo(vid);
     if (!data || !data.embeds || !data.embeds.length) {
       data = await this.scrapeVideoLight(vid);
     }
+    // Use cached streams if fresh (< 10 min)
+    if (data.streams && data.streams.length && data.scrapedAt) {
+      const age = Date.now() - new Date(data.scrapedAt).getTime();
+      if (age < 10 * 60 * 1000) {
+        return { vid, embeds: data.embeds, streams: data.streams, probes: data.m3u8Probes || [], cached: true };
+      }
+    }
     const urls = (data.embeds || []).map(e => e.url);
-    const probes = await this.prober.probeMany(urls, maxProbe);
+    // probe friendly only first for speed
+    const friendly = urls.filter(u => this.prober.isFriendlyHost(u)).slice(0, maxProbe);
+    const probes = await this.prober.probeMany(friendly.length ? friendly : urls.slice(0, maxProbe), maxProbe);
     const streams = [];
     for (const p of probes) {
       if (p.m3u8) streams.push({ type: 'm3u8', url: p.m3u8, embed: p.embedUrl });
@@ -934,8 +960,16 @@ class LarozaScraper extends EventEmitter {
         }
       }
     }
+    // Always expose embed proxy fallbacks so client can play via our server page-proxy
+    const embedFallbacks = (data.embeds || []).slice(0, 8).map(e => ({
+      type: 'embed',
+      url: e.url,
+      embed: e.url,
+      id: e.id,
+      name: e.name
+    }));
     if (streams.length) this.store.upsertVideo(vid, { streams, m3u8Probes: probes });
-    return { vid, embeds: data.embeds, streams, probes };
+    return { vid, embeds: data.embeds, streams, embedFallbacks, probes };
   }
 
   async scrapeCategory(catKey, maxPages = 2, enqueue = false) {
@@ -1094,7 +1128,7 @@ class ApiServer {
     if (method === 'GET' && (pathname === '/' || pathname === '/api')) {
       return this.json(res, 200, {
         name: 'Laroza Scraper API',
-        version: '2.3.0',
+        version: '2.3.1',
         endpoints: [
           'GET /health',
           'GET /api/categories',
@@ -1102,6 +1136,7 @@ class ApiServer {
           'GET /api/scrape/video-light/:vid',
           'GET /api/scrape/video/:vid',
           'GET /api/stream/resolve/:vid',
+          'GET /api/stream/play/:vid',
           'GET /api/stream/proxy?url=&ref=',
           'GET /api/recommend/:vid',
           'GET /api/video/:vid'
@@ -1126,7 +1161,7 @@ class ApiServer {
   start(port = CONFIG.PORT, host = CONFIG.HOST) {
     this.server = http.createServer((req, res) => this.handle(req, res));
     this.server.listen(port, host, () => {
-      Logger.success(`Laroza API v2.3 → http://${host}:${port}`);
+      Logger.success(`Laroza API v2.3.1 → http://${host}:${port}`);
       Logger.info('Proxy: ' + (this.scraper.client.proxyManager.hasProxy() ? 'YES' : 'NO'));
     });
   }
@@ -1135,7 +1170,7 @@ class ApiServer {
 function setupRoutes(api, scraper, store) {
   api.get('/health', async (req, res) => {
     api.json(res, 200, {
-      status: 'ok', version: '2.3.0', uptime: process.uptime(),
+      status: 'ok', version: '2.3.1', uptime: process.uptime(),
       videos: store.stats.totalVideos, proxy: scraper.client.proxyManager.hasProxy()
     });
   });
@@ -1143,7 +1178,7 @@ function setupRoutes(api, scraper, store) {
   api.get('/api/stats', async (req, res) => {
     api.json(res, 200, {
       stats: store.stats, queueLength: scraper.queue.length, visited: scraper.visited.size,
-      proxyEnabled: scraper.client.proxyManager.hasProxy(), cfHits: scraper.client.cfHits || 0, version: '2.3.0'
+      proxyEnabled: scraper.client.proxyManager.hasProxy(), cfHits: scraper.client.cfHits || 0, version: '2.3.1'
     });
   });
 
@@ -1236,6 +1271,35 @@ function setupRoutes(api, scraper, store) {
       proxyUrl: `/api/stream/proxy?url=${encodeURIComponent(s.url)}&ref=${encodeURIComponent(s.embed || CONFIG.BASE_URL + '/')}`
     }));
     api.json(res, 200, { ...data, streams: proxied });
+  });
+
+  api.get('/api/stream/play/:vid', async (req, res) => {
+    const maxProbe = parseInt(req.query.maxProbe || '3', 10);
+    const data = await scraper.resolveStreams(req.params.vid, maxProbe);
+    store.save();
+    const base = '';
+    const streams = (data.streams || []).map(s => ({
+      ...s,
+      playUrl: `/api/stream/proxy?url=${encodeURIComponent(s.url)}&ref=${encodeURIComponent(s.embed || CONFIG.BASE_URL + '/')}`
+    }));
+    // Best effort: first m3u8 then mp4 then any
+    const best = streams.find(s => s.type === 'm3u8') || streams.find(s => s.type === 'mp4') || streams[0] || null;
+    const embeds = (data.embeds || []).map((e, i) => ({
+      id: e.id || (i + 1),
+      name: e.name || ('سيرفر ' + (i + 1)),
+      embedUrl: e.url,
+      // client can iframe this directly OR we can open in new tab
+    }));
+    api.json(res, 200, {
+      vid: req.params.vid,
+      best,
+      streams,
+      embeds,
+      cached: !!data.cached,
+      hint: !streams.length
+        ? 'No direct m3u8 extracted (host uses JS). Use embeds[] in iframe, or set PROXY_URL and retry.'
+        : 'Use best.playUrl with hls.js or video tag'
+    });
   });
 
   api.get('/api/probe/:vid', async (req, res) => {
