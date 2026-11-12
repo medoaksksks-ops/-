@@ -1,8 +1,19 @@
 /**
  * ============================================================================
- * LAROZA PLAYER — SCRAPER / API / WEB UI SERVER                    v3.0.0
+ * LAROZA PLAYER — SCRAPER / API / WEB UI SERVER                    v3.1.0
  * ============================================================================
  * Single-file Node.js server (Node >= 18, no required dependencies).
+ *
+ * What changed in v3.1.0 (vs v3.0.0):
+ *  - GET /api/img?u=<url>   poster/thumbnail proxy (sends the site as Referer,
+ *    validates real image bytes, memory cache, long browser cache). Fixes images
+ *    that never showed up on the front-end.
+ *  - POST /api/track        visitor tracking (IP, device, browser, OS, country,
+ *    page, referrer) saved to Firebase Realtime Database via REST.
+ *  - GET  /dashboard        visitors dashboard (login with ADMIN_TOKEN).
+ *    GET  /api/admin/analytics  JSON used by the dashboard (header X-Admin-Token).
+ *  - Download servers were already exposed at /api/video/:vid/downloads (the
+ *    front-end v16 now shows them).
  *
  * What changed vs v2.2 (summary):
  *  - Follows the site's domain redirects (laroza1.lat -> laroza-tv.cfd ...) and
@@ -22,6 +33,12 @@
  *    results are never stored; atomic disk persistence.
  *  - New RTL UI: two playback modes (Laroza servers / direct), HLS.js,
  *    retry, fullscreen, mobile layout, episode navigation that keeps the mode.
+ *
+ * New env (v3.1):
+ *   ADMIN_TOKEN (REQUIRED for the dashboard), FIREBASE_URL, FIREBASE_SERVICE_ACCOUNT
+ *   (service-account JSON or base64 of it — recommended) or FIREBASE_SECRET,
+ *   STATS_TZ (default Africa/Cairo), TRUST_PROXY_HOPS (default 1), GEO_LOOKUP=0 to
+ *   disable country lookup, HITS_RETENTION_DAYS (default 30), IMG_CACHE_MB.
  *
  * Env (all optional):
  *   PORT, HOST, BASE_URL, FALLBACK_BASES (comma list), ADOPT_REDIRECTS=0,
@@ -54,7 +71,7 @@ const listEnv = (name, def) =>
     .split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
 
 const CONFIG = {
-  VERSION: '3.0.0',
+  VERSION: '3.1.0',
   BASE_URL: (process.env.BASE_URL || 'https://laroza1.lat').replace(/\/+$/, ''),
   FALLBACK_BASES: listEnv('FALLBACK_BASES', 'https://laroza-tv.cfd'),
   ADOPT_REDIRECTS: process.env.ADOPT_REDIRECTS !== '0',
@@ -94,6 +111,24 @@ const CONFIG = {
   RATE_LIMIT_PER_MIN: intEnv('RATE_LIMIT_PER_MIN', 180),
   CORS_ORIGIN: process.env.CORS_ORIGIN || '*',
   ADMIN_TOKEN: process.env.ADMIN_TOKEN || '',
+
+  // v3.1 — image proxy
+  IMG_CONCURRENCY: Math.max(1, intEnv('IMG_CONCURRENCY', 8)),
+  IMG_MAX_BYTES: 4 * 1024 * 1024,
+  IMG_CACHE_BYTES: Math.max(8, intEnv('IMG_CACHE_MB', 48)) * 1024 * 1024,
+  IMG_CACHE_ITEMS: 1500,
+  IMG_CACHE_TTL: 12 * 3600e3,
+  IMG_RATE_PER_MIN: intEnv('IMG_RATE_PER_MIN', 1500),
+
+  // v3.1 — visitor analytics (Firebase Realtime Database over REST)
+  FIREBASE_URL: (process.env.FIREBASE_URL || 'https://english-73376-default-rtdb.firebaseio.com').replace(/\/+$/, ''),
+  FIREBASE_SECRET: process.env.FIREBASE_SECRET || '',
+  FIREBASE_SERVICE_ACCOUNT: process.env.FIREBASE_SERVICE_ACCOUNT || '',
+  STATS_TZ: process.env.STATS_TZ || 'Africa/Cairo',
+  TRUST_PROXY_HOPS: Math.max(1, intEnv('TRUST_PROXY_HOPS', 1)),
+  GEO_LOOKUP: process.env.GEO_LOOKUP !== '0',
+  HITS_RETENTION_DAYS: Math.max(2, intEnv('HITS_RETENTION_DAYS', 30)),
+  TRACK_RATE_PER_MIN: intEnv('TRACK_RATE_PER_MIN', 40),
 
   // Category keys observed on the live site (menu + footer, Nov 2026).
   CATEGORIES: {
@@ -2415,6 +2450,809 @@ const EMBEDDED_JS = String.raw`/* Laroza Player v3.0.0 — front-end */
 `;
 
 // ============================================================================
+// v3.1 — IMAGE PROXY, FIREBASE CLIENT, VISITOR ANALYTICS
+// ============================================================================
+
+/** Detects the real image type from magic bytes (never trusts the upstream header). */
+function sniffImage(b) {
+  if (!b || b.length < 12) return '';
+  if (b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return 'image/jpeg';
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return 'image/png';
+  if (b.toString('latin1', 0, 4) === 'GIF8') return 'image/gif';
+  if (b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WEBP') return 'image/webp';
+  if (b.toString('latin1', 4, 8) === 'ftyp' && /avif|avis/.test(b.toString('latin1', 8, 16))) return 'image/avif';
+  return '';
+}
+
+/**
+ * Poster/thumbnail proxy. Browsers cannot load the source site's images directly
+ * (hotlink/referrer checks), so the server fetches them with the site as Referer,
+ * validates that the bytes really are an image, caches them in memory and serves
+ * them with long browser-cache headers.
+ */
+class ImageProxy {
+  constructor(site) {
+    this.site = site;
+    this.cache = new Map();
+    this.bytes = 0;
+    this.inflight = new Map();
+    this.active = 0;
+    this.waiters = [];
+    this.stats = { hits: 0, misses: 0, errors: 0 };
+  }
+  async _acquire() {
+    if (this.active < CONFIG.IMG_CONCURRENCY) { this.active++; return; }
+    await new Promise(r => this.waiters.push(r));
+  }
+  _release() { const w = this.waiters.shift(); if (w) w(); else this.active--; }
+  _evict() {
+    while ((this.bytes > CONFIG.IMG_CACHE_BYTES || this.cache.size > CONFIG.IMG_CACHE_ITEMS) && this.cache.size) {
+      const k = this.cache.keys().next().value;
+      const e = this.cache.get(k);
+      this.bytes -= e.buf ? e.buf.length : 0;
+      this.cache.delete(k);
+    }
+  }
+  _put(url, entry) {
+    const old = this.cache.get(url);
+    if (old && old.buf) this.bytes -= old.buf.length;
+    this.cache.delete(url);
+    this.cache.set(url, entry);
+    if (entry.buf) this.bytes += entry.buf.length;
+    this._evict();
+  }
+
+  async get(rawUrl) {
+    const url = resolveUrl(rawUrl, this.site.origin + '/');
+    if (!url) throw new HttpError(400, 'bad image url', 'BAD_REQUEST');
+    const hit = this.cache.get(url);
+    if (hit && Date.now() < hit.exp) {
+      this.cache.delete(url); this.cache.set(url, hit); // refresh LRU position
+      this.stats.hits++;
+      if (hit.fail) throw new HttpError(404, 'image unavailable', 'NOT_FOUND');
+      return hit;
+    }
+    if (this.inflight.has(url)) return this.inflight.get(url);
+    this.stats.misses++;
+    const p = this._load(url).finally(() => this.inflight.delete(url));
+    this.inflight.set(url, p);
+    return p;
+  }
+
+  async _load(url) {
+    await this._acquire();
+    try {
+      const host = hostOf(url);
+      const headers = {
+        'User-Agent': CONFIG.USER_AGENT,
+        'Accept': 'image/avif,image/webp,image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5',
+        'Accept-Language': 'ar,en;q=0.8',
+        'Referer': this.site.origin + '/'
+      };
+      const jar = this.site.cookies.get(host);
+      if (jar && jar.size) headers['Cookie'] = [...jar].map(([k, v]) => k + '=' + v).join('; ');
+      let res;
+      try {
+        res = await httpRequest(url, { headers, maxBytes: CONFIG.IMG_MAX_BYTES, timeout: 12000, trustedHosts: this.site.trusted });
+      } catch (e) {
+        this.stats.errors++;
+        this._put(url, { fail: true, exp: Date.now() + 60e3 });
+        throw e;
+      }
+      const type = res.status === 200 ? sniffImage(res.body) : '';
+      if (!type) {
+        this.stats.errors++;
+        this._put(url, { fail: true, exp: Date.now() + 60e3 });
+        throw new HttpError(404, 'upstream did not return an image (status ' + res.status + ')', 'NOT_FOUND');
+      }
+      const crypto = require('crypto');
+      const etag = '"' + crypto.createHash('sha1').update(res.body).digest('base64url').slice(0, 20) + '"';
+      const entry = { buf: res.body, type, etag, exp: Date.now() + CONFIG.IMG_CACHE_TTL };
+      this._put(url, entry);
+      return entry;
+    } finally {
+      this._release();
+    }
+  }
+}
+
+/** Minimal Firebase Realtime Database REST client (no SDK). */
+class FirebaseDB {
+  constructor() {
+    this.base = String(CONFIG.FIREBASE_URL || '').replace(/\/+$/, '');
+    this.secret = CONFIG.FIREBASE_SECRET;
+    this.sa = null;
+    this.tok = null;
+    this.tokExp = 0;
+    this.tokPromise = null;
+    let raw = String(CONFIG.FIREBASE_SERVICE_ACCOUNT || '').trim();
+    if (raw) {
+      try {
+        if (raw[0] !== '{') raw = Buffer.from(raw, 'base64').toString('utf8');
+        this.sa = JSON.parse(raw);
+        if (!this.sa.client_email || !this.sa.private_key) throw new Error('missing client_email/private_key');
+      } catch (e) {
+        Logger.error('FIREBASE_SERVICE_ACCOUNT is invalid:', e.message);
+        this.sa = null;
+      }
+    }
+  }
+  get enabled() { return !!this.base; }
+  get mode() { return this.sa ? 'service-account' : this.secret ? 'secret' : 'open'; }
+
+  async _token() {
+    if (this.tok && Date.now() < this.tokExp - 60e3) return this.tok;
+    if (this.tokPromise) return this.tokPromise;
+    this.tokPromise = (async () => {
+      const crypto = require('crypto');
+      const now = Math.floor(Date.now() / 1000);
+      const b64 = o => Buffer.from(JSON.stringify(o)).toString('base64url');
+      const uri = this.sa.token_uri || 'https://oauth2.googleapis.com/token';
+      const unsigned = b64({ alg: 'RS256', typ: 'JWT' }) + '.' + b64({
+        iss: this.sa.client_email,
+        scope: 'https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email',
+        aud: uri, iat: now, exp: now + 3600
+      });
+      const sig = crypto.sign('RSA-SHA256', Buffer.from(unsigned), this.sa.private_key).toString('base64url');
+      const res = await fetch(uri, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: unsigned + '.' + sig }),
+        signal: AbortSignal.timeout(8000)
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || !j.access_token) throw new Error('google token error ' + res.status + ' ' + (j.error_description || j.error || ''));
+      this.tok = j.access_token;
+      this.tokExp = Date.now() + (j.expires_in || 3600) * 1000;
+      return this.tok;
+    })().finally(() => { this.tokPromise = null; });
+    return this.tokPromise;
+  }
+
+  async req(method, p, body, query) {
+    if (!this.enabled) throw new Error('firebase disabled');
+    const qs = new URLSearchParams(query || {});
+    const headers = {};
+    if (this.sa) headers['Authorization'] = 'Bearer ' + await this._token();
+    else if (this.secret) qs.set('auth', this.secret);
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    const q = qs.toString();
+    const url = this.base + '/' + p + '.json' + (q ? '?' + q : '');
+    const res = await fetch(url, {
+      method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(8000)
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error('firebase ' + method + ' /' + p + ' -> ' + res.status + ' ' + text.slice(0, 140));
+    return text ? JSON.parse(text) : null;
+  }
+  get(p, query) { return this.req('GET', p, undefined, query); }
+  put(p, v) { return this.req('PUT', p, v); }
+  patch(p, v) { return this.req('PATCH', p, v); }
+}
+
+function parseUA(ua) {
+  ua = String(ua || '');
+  let os = 'Other', browser = 'Other', device = 'Desktop', model = '';
+  if (/Windows NT/i.test(ua)) os = 'Windows';
+  else if (/Android/i.test(ua)) os = 'Android';
+  else if (/iPhone|iPad|iPod/i.test(ua)) os = 'iOS';
+  else if (/Mac OS X|Macintosh/i.test(ua)) os = 'macOS';
+  else if (/CrOS/i.test(ua)) os = 'ChromeOS';
+  else if (/Linux/i.test(ua)) os = 'Linux';
+  if (/SmartTV|SMART-TV|HbbTV|Tizen|Web0S|WebOS|AppleTV|CrKey|BRAVIA/i.test(ua)) device = 'TV';
+  else if (/iPad|Tablet|PlayBook|Android(?!.*Mobile)/i.test(ua)) device = 'Tablet';
+  else if (/Mobi|iPhone|iPod|Android.*Mobile/i.test(ua)) device = 'Mobile';
+  if (/EdgA?\/|EdgiOS\//.test(ua)) browser = 'Edge';
+  else if (/OPR\/|Opera/.test(ua)) browser = 'Opera';
+  else if (/SamsungBrowser/.test(ua)) browser = 'Samsung';
+  else if (/UCBrowser/.test(ua)) browser = 'UC';
+  else if (/FBAN|FBAV/.test(ua)) browser = 'Facebook';
+  else if (/Instagram/.test(ua)) browser = 'Instagram';
+  else if (/CriOS|Chrome\//.test(ua)) browser = 'Chrome';
+  else if (/FxiOS|Firefox\//.test(ua)) browser = 'Firefox';
+  else if (/Safari\//.test(ua)) browser = 'Safari';
+  else if (/MSIE|Trident/.test(ua)) browser = 'IE';
+  const m = ua.match(/Android [\d.]+;\s*([^;)]+?)(?:\s+Build|[;)])/);
+  if (m && !/^(K|Mobile|wv)$/i.test(m[1].trim())) model = m[1].trim().slice(0, 40);
+  else if (/iPhone/.test(ua)) model = 'iPhone';
+  else if (/iPad/.test(ua)) model = 'iPad';
+  return { os, browser, device, model };
+}
+
+const BOT_RE = /bot|crawl|spider|slurp|headless|lighthouse|pingdom|uptime|monitor|curl\/|wget|python-requests|axios|node-fetch|go-http|facebookexternalhit|preview|scanner|httpclient/i;
+const safeKey = s => String(s == null || s === '' ? 'Other' : s).replace(/[.$#\[\]\/\u0000-\u001f]/g, '_').slice(0, 30) || 'Other';
+const clip = (s, n) => String(s == null ? '' : s).replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, n);
+const VID_RE = /^[A-Za-z0-9-]{8,40}$/;
+
+/** Client IP: trusts TRUST_PROXY_HOPS reverse proxies (Railway = 1). */
+function clientIp(req) {
+  const strip = ip => String(ip || '').trim().replace(/^::ffff:/i, '');
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',').map(strip).filter(Boolean);
+  let ip = '';
+  if (xff.length) {
+    const i = Math.max(0, xff.length - Math.max(1, CONFIG.TRUST_PROXY_HOPS));
+    ip = xff[i];
+    if (!net.isIP(ip) || isPrivateIP(ip)) ip = xff.find(x => net.isIP(x) && !isPrivateIP(x)) || ip;
+  }
+  if (!net.isIP(ip)) ip = strip(req.headers['x-real-ip']);
+  if (!net.isIP(ip)) ip = strip(req.socket && req.socket.remoteAddress);
+  return net.isIP(ip) ? ip : 'unknown';
+}
+
+class Analytics {
+  constructor(fb) {
+    this.fb = fb;
+    this.seen = new Map();      // visitorId -> last date (LRU)
+    this.pings = new Map();     // visitorId -> last ping ms
+    this.geoCache = new Map();  // ip -> { v, exp }
+    this.geoWindow = { start: 0, n: 0 };
+    this.queue = [];
+    this.running = 0;
+    this.chain = new Map();     // visitorId -> promise (serialises writes of one visitor)
+    this.pruned = '';
+    this.counters = { accepted: 0, skippedBots: 0, written: 0, failed: 0, dropped: 0 };
+    this.fmt = new Intl.DateTimeFormat('en-CA', { timeZone: CONFIG.STATS_TZ, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' });
+  }
+
+  when(ms) {
+    const p = {};
+    for (const x of this.fmt.formatToParts(new Date(ms))) p[x.type] = x.value;
+    return { date: `${p.year}-${p.month}-${p.day}`, hour: p.hour === '24' ? '00' : p.hour };
+  }
+
+  enqueue(fn) {
+    if (this.queue.length >= 1000) { this.counters.dropped++; return; }
+    this.queue.push(fn);
+    this._pump();
+  }
+  _pump() {
+    while (this.running < 4 && this.queue.length) {
+      const fn = this.queue.shift();
+      this.running++;
+      fn().catch(e => { this.counters.failed++; Logger.warn('analytics write failed:', e.message); })
+        .finally(() => { this.running--; this._pump(); });
+    }
+  }
+
+  /** Runs fn after the previous write of the same visitor finished (prevents double-counting). */
+  serial(vid, fn) {
+    const prev = this.chain.get(vid) || Promise.resolve();
+    const run = prev.catch(() => {}).then(fn);
+    this.chain.set(vid, run);
+    run.catch(() => {}).finally(() => { if (this.chain.get(vid) === run) this.chain.delete(vid); });
+    return run;
+  }
+
+  async geo(ip, headerCountry) {
+    const cc = /^[A-Za-z]{2}$/.test(headerCountry || '') ? headerCountry.toUpperCase() : '';
+    if (cc) return { cc, city: '' };
+    if (!CONFIG.GEO_LOOKUP || isPrivateIP(ip) || !net.isIP(ip)) return { cc: '', city: '' };
+    const hit = this.geoCache.get(ip);
+    if (hit && Date.now() < hit.exp) return hit.v;
+    const now = Date.now();
+    if (now - this.geoWindow.start > 60e3) this.geoWindow = { start: now, n: 0 };
+    if (this.geoWindow.n >= 40) return { cc: '', city: '' }; // free API limit is 45/min
+    this.geoWindow.n++;
+    let v = { cc: '', city: '' };
+    try {
+      const r = await fetch('http://ip-api.com/json/' + encodeURIComponent(ip) + '?fields=status,countryCode,city', { signal: AbortSignal.timeout(2500) });
+      const j = await r.json();
+      if (j && j.status === 'success') v = { cc: clip(j.countryCode, 2), city: clip(j.city, 40) };
+    } catch (_) { /* geo is best-effort */ }
+    this.geoCache.set(ip, { v, exp: Date.now() + (v.cc ? 24 * 3600e3 : 10 * 60e3) });
+    if (this.geoCache.size > 5000) this.geoCache.delete(this.geoCache.keys().next().value);
+    return v;
+  }
+
+  /** Validates synchronously, then writes to Firebase in the background. */
+  track({ ip, ua, body, country }) {
+    if (!this.fb.enabled) return { ok: false, reason: 'disabled' };
+    const b = body && typeof body === 'object' ? body : {};
+    const vid = String(b.v || '');
+    if (!VID_RE.test(vid)) throw new HttpError(400, 'bad visitor id', 'BAD_REQUEST');
+    if (BOT_RE.test(ua || '')) { this.counters.skippedBots++; return { ok: true, skipped: 'bot' }; }
+    const type = b.t === 'ping' ? 'ping' : 'pv';
+    const now = Date.now();
+    this.counters.accepted++;
+    const info = parseUA(ua);
+    const page = clip(b.p, 120) || '/';
+
+    if (type === 'ping') {
+      const last = this.pings.get(vid) || 0;
+      if (now - last < 20e3) return { ok: true, skipped: 'throttled' };
+      this.pings.set(vid, now);
+      if (this.pings.size > 20000) this.pings.delete(this.pings.keys().next().value);
+      this.enqueue(async () => {
+        const g = await this.geo(ip, country);
+        await this.fb.put('online/' + vid, { t: now, ip, p: page, d: info.device, c: g.cc });
+      });
+      return { ok: true };
+    }
+
+    const rec = {
+      sc: clip(b.sc, 14), vp: clip(b.vp, 14), dpr: clip(b.dpr, 5), lang: clip(b.lang, 12), tz: clip(b.tz, 40),
+      cn: clip(b.cn, 10), mem: clip(b.mem, 4), cores: clip(b.cores, 3), ref: clip(b.ref, 60), ti: clip(b.ti, 80),
+      ver: clip(b.ver, 10)
+    };
+    const first = b.f === true || b.f === 1;
+    this.enqueue(() => this.serial(vid, async () => {
+      let last = this.seen.get(vid);
+      if (last === undefined) last = await this.fb.get('visitors/' + vid + '/lastDate');
+      const w = this.when(now);
+      const isNew = last == null;
+      const isNewDay = last !== w.date;
+      const g = await this.geo(ip, country);
+      const u = {};
+      const base = 'visitors/' + vid;
+      u[base + '/ip'] = ip;
+      u[base + '/ua'] = clip(ua, 220);
+      u[base + '/os'] = info.os; u[base + '/browser'] = info.browser; u[base + '/device'] = info.device; u[base + '/model'] = info.model;
+      u[base + '/country'] = g.cc; u[base + '/city'] = g.city;
+      u[base + '/screen'] = rec.sc; u[base + '/viewport'] = rec.vp; u[base + '/dpr'] = rec.dpr;
+      u[base + '/lang'] = rec.lang; u[base + '/tz'] = rec.tz; u[base + '/conn'] = rec.cn; u[base + '/memGB'] = rec.mem; u[base + '/cores'] = rec.cores;
+      u[base + '/lastSeen'] = now; u[base + '/lastDate'] = w.date; u[base + '/lastPage'] = page;
+      if (rec.ref) u[base + '/lastRef'] = rec.ref;
+      if (isNew) u[base + '/firstSeen'] = now;
+      u[base + '/views'] = { '.sv': { increment: 1 } };
+      if (isNewDay) u[base + '/days'] = { '.sv': { increment: 1 } };
+
+      const key = now.toString(36).padStart(9, '0') + Math.random().toString(36).slice(2, 6);
+      u['hits/' + w.date + '/' + key] = {
+        t: now, v: vid.slice(0, 8), ip, p: page, c: g.cc, ci: g.city, d: info.device, m: info.model,
+        b: info.browser, o: info.os, n: isNew ? 1 : 0, r: rec.ref
+      };
+
+      const day = 'stats/daily/' + w.date;
+      const inc = { '.sv': { increment: 1 } };
+      u[day + '/views'] = inc;
+      u[day + '/hours/' + w.hour] = inc;
+      u['stats/total/views'] = inc;
+      if (first) u[day + '/sessions'] = inc;
+      if (isNew) { u['stats/total/visitors'] = inc; u[day + '/newVisitors'] = inc; }
+      if (isNewDay) {
+        u[day + '/visitors'] = inc;
+        u[day + '/dev/' + safeKey(info.device)] = inc;
+        u[day + '/os/' + safeKey(info.os)] = inc;
+        u[day + '/br/' + safeKey(info.browser)] = inc;
+        u[day + '/country/' + safeKey(g.cc || '??')] = inc;
+      }
+      await this.fb.patch('', u);
+      this.counters.written++;
+      this.seen.delete(vid);
+      this.seen.set(vid, w.date);
+      if (this.seen.size > 20000) this.seen.delete(this.seen.keys().next().value);
+      this.prune(w.date, now).catch(() => {});
+    }));
+    return { ok: true };
+  }
+
+  /** Deletes the raw hit log of old days (keeps the aggregated stats forever). */
+  async prune(today, now) {
+    if (this.pruned === today) return;
+    this.pruned = today;
+    for (let i = 0; i < 3; i++) {
+      const d = this.when(now - (CONFIG.HITS_RETENTION_DAYS + i) * 86400e3).date;
+      await this.fb.req('DELETE', 'hits/' + d);
+    }
+  }
+
+  async summary(days) {
+    days = clampInt(days, 1, 60, 14);
+    const now = Date.now();
+    const w = this.when(now);
+    const yesterday = this.when(now - 86400e3).date;
+    const [total, daily, online, hitsToday, hitsYest] = await Promise.all([
+      this.fb.get('stats/total'),
+      this.fb.get('stats/daily', { orderBy: '"$key"', limitToLast: String(days) }),
+      this.fb.get('online'),
+      this.fb.get('hits/' + w.date, { orderBy: '"$key"', limitToLast: '300' }),
+      this.fb.get('hits/' + yesterday, { orderBy: '"$key"', limitToLast: '100' })
+    ]);
+
+    const dailyList = Object.keys(daily || {}).sort().map(date => {
+      const x = daily[date] || {};
+      return {
+        date, visitors: x.visitors || 0, views: x.views || 0, newVisitors: x.newVisitors || 0, sessions: x.sessions || 0,
+        hours: x.hours || {}, dev: x.dev || {}, os: x.os || {}, br: x.br || {}, country: x.country || {}
+      };
+    });
+    // fill missing days so the chart has no gaps
+    const byDate = new Map(dailyList.map(x => [x.date, x]));
+    const filled = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = this.when(now - i * 86400e3).date;
+      filled.push(byDate.get(d) || { date: d, visitors: 0, views: 0, newVisitors: 0, sessions: 0, hours: {}, dev: {}, os: {}, br: {}, country: {} });
+    }
+
+    const onl = [];
+    const stale = {};
+    for (const [id, o] of Object.entries(online || {})) {
+      if (!o || typeof o.t !== 'number') { stale[id] = null; continue; }
+      if (now - o.t <= 5 * 60e3) onl.push({ ip: o.ip, page: o.p, device: o.d, country: o.c, t: o.t });
+      else if (now - o.t > 30 * 60e3) stale[id] = null;
+    }
+    onl.sort((a, b) => b.t - a.t);
+    if (Object.keys(stale).length) this.fb.patch('online', stale).catch(() => {});
+
+    const recent = [];
+    for (const src of [hitsToday, hitsYest]) {
+      for (const h of Object.values(src || {})) {
+        if (h && typeof h.t === 'number') recent.push({ t: h.t, ip: h.ip, page: h.p, country: h.c, city: h.ci, device: h.d, model: h.m, browser: h.b, os: h.o, isNew: !!h.n });
+      }
+    }
+    recent.sort((a, b) => b.t - a.t);
+
+    return {
+      version: CONFIG.VERSION, now, today: w.date, tz: CONFIG.STATS_TZ, firebase: this.fb.mode,
+      total: { visitors: (total && total.visitors) || 0, views: (total && total.views) || 0 },
+      daily: filled, online: onl, recent: recent.slice(0, 200), counters: this.counters
+    };
+  }
+}
+
+const DASHBOARD_HTML = `<!doctype html>
+<!-- لوحة زوار ع رواقة — Dashboard v1.0 (served by Laroza server v3.1.0) -->
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<meta name="theme-color" content="#0d1a20">
+<title>لوحة زوار ع رواقة</title>
+<style>
+:root{--ink:#0d1a20;--p1:#12242c;--p2:#193139;--line:#27454f;--cream:#f4ecd9;--mute:#97aeb2;--ember:#ef6f3c;--views:#4f8896;--mint:#8fd3b6;--bad:#ff8a80}
+*{box-sizing:border-box;margin:0}
+body{font-family:Cairo,Tahoma,Arial,system-ui,sans-serif;background:var(--ink);color:var(--cream);line-height:1.6;-webkit-font-smoothing:antialiased}
+.hidden{display:none!important}
+.wrap{width:min(1180px,calc(100% - 28px));margin:0 auto;padding:18px 0 40px}
+h1{font-size:22px;font-weight:800}
+h2{font-size:15px;font-weight:800;margin-bottom:10px}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:10px;justify-content:space-between;margin-bottom:16px}
+.tools{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:13px;color:var(--mute)}
+button,select,input{font:inherit;color:inherit}
+button,select{background:var(--p2);border:1px solid var(--line);border-radius:10px;padding:6px 12px;cursor:pointer}
+button:hover,select:hover{border-color:var(--ember)}
+input[type=search],input[type=password]{background:var(--p1);border:1px solid var(--line);border-radius:10px;padding:7px 12px;min-width:0}
+:focus-visible{outline:2px solid var(--ember);outline-offset:2px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
+.card{background:var(--p1);border:1px solid var(--line);border-radius:14px;padding:12px 14px}
+.card small{display:block;color:var(--mute);font-size:12px}
+.card b{display:block;font-size:26px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.3}
+.card.live b{color:var(--mint)}
+.grid2{display:grid;grid-template-columns:1fr;gap:14px;margin-bottom:14px}
+@media(min-width:900px){.grid2{grid-template-columns:1.6fr 1fr}.grid4{grid-template-columns:repeat(4,1fr)!important}}
+.panel{background:var(--p1);border:1px solid var(--line);border-radius:16px;padding:14px;min-width:0}
+.grid4{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin-bottom:14px}
+.legend{display:flex;gap:14px;font-size:12px;color:var(--mute);margin-bottom:6px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-inline-end:5px;vertical-align:-1px}
+.bars{display:flex;align-items:flex-end;gap:4px;height:170px;direction:ltr}
+.col{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:flex-end;height:100%;cursor:default}
+.stack{position:relative;flex:1;display:flex;align-items:flex-end;justify-content:center}
+.stack i{display:block;position:absolute;bottom:0;border-radius:4px 4px 0 0;min-height:2px}
+.b1{background:var(--ember);width:46%;z-index:2;inset-inline-start:auto}
+.b2{background:var(--views);width:100%;max-width:26px}
+.b1{max-width:14px}
+.col:hover .b1{filter:brightness(1.15)}
+.lb{font-size:10px;color:var(--mute);text-align:center;height:16px;white-space:nowrap;overflow:hidden}
+.row{margin-bottom:9px}
+.rl{display:flex;justify-content:space-between;font-size:13px;gap:8px}
+.rl b{font-weight:600;color:var(--mute);font-variant-numeric:tabular-nums;white-space:nowrap}
+.track{height:6px;border-radius:6px;background:var(--p2);margin-top:3px;overflow:hidden}
+.track i{display:block;height:100%;background:var(--ember);border-radius:6px}
+.empty{color:var(--mute);font-size:13px;padding:8px 0;text-align:center}
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{color:var(--mute);font-weight:600;text-align:start;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:7px 8px;border-bottom:1px solid #27454f55;vertical-align:top}
+.ltr{direction:ltr;text-align:left;unicode-bidi:plaintext}
+.trunc{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge{display:inline-block;margin-inline-start:6px;padding:0 7px;border-radius:7px;font-size:11px;font-weight:800;background:var(--p2);color:var(--mute)}
+.badge.new{background:var(--mint);color:#0d1a20}
+#tip{position:fixed;z-index:50;pointer-events:none;background:#000d;border:1px solid var(--line);padding:5px 10px;border-radius:9px;font-size:12px;max-width:80vw}
+#login{max-width:360px;margin:12vh auto 0;background:var(--p1);border:1px solid var(--line);border-radius:18px;padding:22px}
+#login form{display:flex;gap:8px;margin-top:12px}
+#login input{flex:1}
+#loginMsg{color:var(--bad);font-size:13px;margin-top:8px;min-height:20px}
+.btn-main{background:var(--ember);border-color:var(--ember);color:#fff;font-weight:700}
+footer{margin-top:20px;font-size:12px;color:var(--mute);display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between}
+</style>
+</head>
+<body>
+<div class="wrap">
+ <section id="login" class="hidden">
+  <h1>لوحة الزوار</h1>
+  <p style="color:var(--mute);font-size:13px">اكتب رمز الإدارة (ADMIN_TOKEN) للدخول.</p>
+  <form id="loginForm"><input id="tokenIn" type="password" autocomplete="current-password" placeholder="رمز الإدارة" aria-label="رمز الإدارة"><button class="btn-main" type="submit">دخول</button></form>
+  <div id="loginMsg" role="alert"></div>
+ </section>
+
+ <div id="app" class="hidden">
+  <header>
+   <h1>لوحة زوار ع رواقة</h1>
+   <div class="tools">
+    <span id="state">...</span>
+    <label><input type="checkbox" id="auto" checked> تحديث تلقائي</label>
+    <select id="range" aria-label="المدة"><option value="7">آخر 7 أيام</option><option value="14" selected>آخر 14 يوم</option><option value="30">آخر 30 يوم</option></select>
+    <button id="refresh" type="button">تحديث</button>
+    <button id="logout" type="button">خروج</button>
+   </div>
+  </header>
+
+  <div class="cards">
+   <div class="card live"><small>متصل دلوقتي (آخر 5 دقايق)</small><b id="kOnline">0</b></div>
+   <div class="card"><small>زوار النهارده</small><b id="kToday">0</b></div>
+   <div class="card"><small>مشاهدات النهارده</small><b id="kViews">0</b></div>
+   <div class="card"><small>زوار جدد النهارده</small><b id="kNew">0</b></div>
+   <div class="card"><small>إجمالي الزوار</small><b id="kTotal">0</b></div>
+   <div class="card"><small>إجمالي المشاهدات</small><b id="kTotalViews">0</b></div>
+  </div>
+
+  <div class="grid2">
+   <section class="panel">
+    <h2>الزوار والمشاهدات يوميًا</h2>
+    <div class="legend"><span><i style="background:var(--ember)"></i>زوار</span><span><i style="background:var(--views)"></i>مشاهدات</span><button id="viewTable" type="button" style="margin-inline-start:auto;padding:1px 10px;font-size:12px">عرض كجدول</button></div>
+    <div id="chDays"></div>
+    <div id="daysTable" class="tw hidden"><table><thead><tr><th>اليوم</th><th>زوار</th><th>مشاهدات</th><th>جدد</th><th>جلسات</th></tr></thead><tbody id="tbDays"></tbody></table></div>
+   </section>
+   <section class="panel">
+    <h2>مشاهدات النهارده حسب الساعة</h2>
+    <div id="chHours"></div>
+   </section>
+  </div>
+
+  <div class="grid4">
+   <section class="panel"><h2>الأجهزة</h2><div id="bDev"></div></section>
+   <section class="panel"><h2>أنظمة التشغيل</h2><div id="bOs"></div></section>
+   <section class="panel"><h2>المتصفحات</h2><div id="bBr"></div></section>
+   <section class="panel"><h2>الدول</h2><div id="bCc"></div></section>
+  </div>
+
+  <section class="panel" style="margin-bottom:14px">
+   <h2>المتصلون الآن</h2>
+   <div class="tw"><table><thead><tr><th>IP</th><th>الجهاز</th><th>الصفحة</th><th>آخر نبضة</th></tr></thead><tbody id="tbOnline"></tbody></table></div>
+  </section>
+
+  <section class="panel">
+   <h2>آخر الزيارات <small style="color:var(--mute);font-weight:400">(<span id="recentCount">0</span>)</small></h2>
+   <p style="margin-bottom:8px"><input id="find" type="search" placeholder="بحث بالـ IP أو الدولة أو الجهاز..." aria-label="بحث في الزيارات" style="width:min(380px,100%)"></p>
+   <div class="tw"><table><thead><tr><th>الوقت</th><th>IP</th><th>المكان</th><th>الجهاز</th><th>المتصفح / النظام</th><th>الصفحة</th></tr></thead><tbody id="tbRecent"></tbody></table></div>
+  </section>
+
+  <footer><span>لوحة الزوار <span id="ver">v1.0</span> — سيرفر لاروزا v3.1.0</span><span id="fb"></span></footer>
+ </div>
+</div>
+<div id="tip" class="hidden"></div>
+<script src="/dashboard.js"></script>
+</body>
+</html>
+`;
+const DASHBOARD_JS = `/* Laroza visitors dashboard — client script v1.0 (no inline handlers, no innerHTML with data) */
+(function () {
+  'use strict';
+  var VERSION = 'v1.0';
+  var KEY = 'lz_admin_token';
+  var $ = function (s) { return document.querySelector(s); };
+  var timer = null, lastData = null, days = 14, filter = '';
+
+  function el(tag, attrs, kids) {
+    var e = document.createElement(tag);
+    if (attrs) for (var k in attrs) {
+      if (k === 'text') e.textContent = attrs[k];
+      else if (k === 'class') e.className = attrs[k];
+      else e.setAttribute(k, attrs[k]);
+    }
+    (kids || []).forEach(function (c) { if (c != null) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
+    return e;
+  }
+  function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
+  function num(n) { return Number(n || 0).toLocaleString('en-US'); }
+  function getToken() { try { return sessionStorage.getItem(KEY) || ''; } catch (e) { return ''; } }
+  function setToken(t) { try { if (t) sessionStorage.setItem(KEY, t); else sessionStorage.removeItem(KEY); } catch (e) { /* ignore */ } }
+
+  function ago(ms) {
+    var s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    if (s < 60) return 'من ' + s + ' ث';
+    var m = Math.round(s / 60);
+    if (m < 60) return 'من ' + m + ' د';
+    var h = Math.round(m / 60);
+    if (h < 24) return 'من ' + h + ' س';
+    return 'من ' + Math.round(h / 24) + ' يوم';
+  }
+  function clock(ms, tz) {
+    try { return new Date(ms).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit', timeZone: tz || undefined }); }
+    catch (e) { return new Date(ms).toLocaleTimeString(); }
+  }
+
+  /* ---------- login ---------- */
+  function showLogin(msg) {
+    $('#app').classList.add('hidden');
+    $('#login').classList.remove('hidden');
+    $('#loginMsg').textContent = msg || '';
+    stop();
+  }
+  function showApp() {
+    $('#login').classList.add('hidden');
+    $('#app').classList.remove('hidden');
+  }
+  function stop() { if (timer) { clearInterval(timer); timer = null; } }
+
+  function load() {
+    var t = getToken();
+    if (!t) { showLogin(''); return; }
+    $('#state').textContent = 'جاري التحديث...';
+    fetch('/api/admin/analytics?days=' + days, { headers: { 'X-Admin-Token': t, 'Accept': 'application/json' }, cache: 'no-store' })
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (d) { return { r: r, d: d }; }); })
+      .then(function (x) {
+        if (x.r.status === 403) { setToken(''); showLogin('الرمز غلط'); return; }
+        if (x.r.status === 429) { showLogin('محاولات كتير، استنى شوية'); return; }
+        if (x.r.status === 503 && x.d.code === 'ADMIN_TOKEN_REQUIRED') { showLogin('لازم تضبط متغير ADMIN_TOKEN على السيرفر الأول'); return; }
+        if (!x.r.ok) { $('#state').textContent = 'خطأ: ' + (x.d.error || x.r.status); return; }
+        lastData = x.d;
+        showApp();
+        render(x.d);
+        $('#state').textContent = 'آخر تحديث ' + clock(Date.now(), x.d.tz);
+        if (!timer) timer = setInterval(function () { if (!document.hidden && $('#auto').checked) load(); }, 20000);
+      })
+      .catch(function () { $('#state').textContent = 'تعذر الاتصال بالسيرفر'; });
+  }
+
+  /* ---------- rendering ---------- */
+  function render(d) {
+    var today = (d.daily || []).filter(function (x) { return x.date === d.today; })[0] || { visitors: 0, views: 0, newVisitors: 0, sessions: 0 };
+    $('#kOnline').textContent = num((d.online || []).length);
+    $('#kToday').textContent = num(today.visitors);
+    $('#kViews').textContent = num(today.views);
+    $('#kNew').textContent = num(today.newVisitors);
+    $('#kTotal').textContent = num(d.total && d.total.visitors);
+    $('#kTotalViews').textContent = num(d.total && d.total.views);
+    $('#fb').textContent = 'Firebase: ' + (d.firebase || '-') + (d.firebase === 'open' ? ' (بدون مصادقة — يفضل تأمينها)' : '');
+    drawDays(d);
+    drawHours(today, d);
+    drawBreakdowns(d);
+    drawOnline(d);
+    drawRecent(d);
+  }
+
+  function tipShow(e, text) {
+    var t = $('#tip');
+    t.textContent = text;
+    t.classList.remove('hidden');
+    var x = Math.min(window.innerWidth - t.offsetWidth - 8, Math.max(8, e.clientX + 12));
+    t.style.left = x + 'px';
+    t.style.top = (e.clientY + 14) + 'px';
+  }
+  function tipHide() { $('#tip').classList.add('hidden'); }
+
+  function bars(box, items, o) {
+    /* items: [{label, a, b, tip}] a = main (visitors), b = secondary (views) */
+    clear(box);
+    var max = 1;
+    items.forEach(function (i) { max = Math.max(max, i.a, i.b || 0); });
+    var wrap = el('div', { class: 'bars', role: 'img', 'aria-label': o.aria });
+    items.forEach(function (i) {
+      var col = el('div', { class: 'col' });
+      var stack = el('div', { class: 'stack' });
+      if (o.both) stack.appendChild(el('i', { class: 'b2', style: 'height:' + Math.round((i.b || 0) / max * 100) + '%' }));
+      stack.appendChild(el('i', { class: 'b1', style: 'height:' + Math.round(i.a / max * 100) + '%' }));
+      col.appendChild(stack);
+      col.appendChild(el('span', { class: 'lb', text: i.label }));
+      col.addEventListener('pointermove', function (e) { tipShow(e, i.tip); });
+      col.addEventListener('pointerleave', tipHide);
+      col.addEventListener('click', function (e) { tipShow(e, i.tip); });
+      wrap.appendChild(col);
+    });
+    box.appendChild(wrap);
+  }
+
+  function drawDays(d) {
+    var list = (d.daily || []).slice();
+    var items = list.map(function (x) {
+      return { label: x.date.slice(5), a: x.visitors || 0, b: x.views || 0, tip: x.date + ' — زوار: ' + num(x.visitors) + ' • مشاهدات: ' + num(x.views) + ' • جدد: ' + num(x.newVisitors) };
+    });
+    bars($('#chDays'), items, { both: true, aria: 'زوار ومشاهدات آخر ' + list.length + ' يوم' });
+    var tb = $('#tbDays'); clear(tb);
+    list.slice().reverse().forEach(function (x) {
+      tb.appendChild(el('tr', null, [el('td', { text: x.date }), el('td', { text: num(x.visitors) }), el('td', { text: num(x.views) }), el('td', { text: num(x.newVisitors) }), el('td', { text: num(x.sessions) })]));
+    });
+  }
+
+  function drawHours(today, d) {
+    var items = [];
+    for (var h = 0; h < 24; h++) {
+      var k = (h < 10 ? '0' : '') + h;
+      var v = (today.hours && today.hours[k]) || 0;
+      items.push({ label: h % 3 === 0 ? k : '', a: v, tip: 'الساعة ' + k + ':00 — مشاهدات: ' + num(v) });
+    }
+    bars($('#chHours'), items, { both: false, aria: 'مشاهدات اليوم حسب الساعة' });
+  }
+
+  function agg(daily, field) {
+    var m = {};
+    daily.forEach(function (x) { var o = x[field] || {}; for (var k in o) m[k] = (m[k] || 0) + (o[k] || 0); });
+    return Object.keys(m).map(function (k) { return { k: k, n: m[k] }; }).sort(function (a, b) { return b.n - a.n; });
+  }
+  function drawList(box, rows, nameMap) {
+    clear(box);
+    var total = rows.reduce(function (s, r) { return s + r.n; }, 0) || 1;
+    if (!rows.length) { box.appendChild(el('div', { class: 'empty', text: 'لا توجد بيانات' })); return; }
+    rows.slice(0, 8).forEach(function (r) {
+      var pct = Math.round(r.n / total * 100);
+      box.appendChild(el('div', { class: 'row' }, [
+        el('div', { class: 'rl' }, [el('span', { text: (nameMap && nameMap[r.k]) || r.k }), el('b', { text: num(r.n) + ' • ' + pct + '%' })]),
+        el('div', { class: 'track' }, [el('i', { style: 'width:' + pct + '%' })])
+      ]));
+    });
+  }
+  function drawBreakdowns(d) {
+    var daily = d.daily || [];
+    drawList($('#bDev'), agg(daily, 'dev'), { Mobile: 'موبايل', Desktop: 'كمبيوتر', Tablet: 'تابلت', TV: 'تلفزيون' });
+    drawList($('#bOs'), agg(daily, 'os'));
+    drawList($('#bBr'), agg(daily, 'br'));
+    drawList($('#bCc'), agg(daily, 'country'), { '??': 'غير معروف' });
+  }
+
+  function badge(txt, cls) { return el('span', { class: 'badge ' + (cls || ''), text: txt }); }
+
+  function drawOnline(d) {
+    var tb = $('#tbOnline'); clear(tb);
+    var list = d.online || [];
+    if (!list.length) { tb.appendChild(el('tr', null, [el('td', { colspan: '4', class: 'empty', text: 'مفيش حد متصل دلوقتي' })])); return; }
+    list.forEach(function (o) {
+      tb.appendChild(el('tr', null, [
+        el('td', { class: 'ltr', text: o.ip || '-' }),
+        el('td', { text: (o.device || '-') + (o.country ? ' • ' + o.country : '') }),
+        el('td', { class: 'ltr trunc', text: o.page || '/' }),
+        el('td', { text: ago(o.t) })
+      ]));
+    });
+  }
+
+  function drawRecent(d) {
+    var tb = $('#tbRecent'); clear(tb);
+    var q = filter.trim().toLowerCase();
+    var list = (d.recent || []).filter(function (r) {
+      if (!q) return true;
+      return [r.ip, r.country, r.city, r.device, r.browser, r.os, r.model, r.page].join(' ').toLowerCase().indexOf(q) > -1;
+    });
+    $('#recentCount').textContent = num(list.length);
+    if (!list.length) { tb.appendChild(el('tr', null, [el('td', { colspan: '6', class: 'empty', text: 'لا توجد زيارات' })])); return; }
+    list.forEach(function (r) {
+      var dev = [r.device, r.model].filter(Boolean).join(' ');
+      var where = [r.country, r.city].filter(Boolean).join(' / ');
+      var ipc = el('td', { class: 'ltr' }, [r.ip || '-']);
+      if (r.isNew) ipc.appendChild(badge('جديد', 'new'));
+      tb.appendChild(el('tr', null, [
+        el('td', { text: clock(r.t, d.tz) }),
+        ipc,
+        el('td', { text: where || '-' }),
+        el('td', { text: dev || '-' }),
+        el('td', { text: [r.browser, r.os].filter(Boolean).join(' • ') || '-' }),
+        el('td', { class: 'ltr trunc', text: r.page || '/' })
+      ]));
+    });
+  }
+
+  /* ---------- wiring ---------- */
+  $('#loginForm').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var v = $('#tokenIn').value.trim();
+    if (!v) return;
+    setToken(v);
+    $('#tokenIn').value = '';
+    load();
+  });
+  $('#logout').addEventListener('click', function () { setToken(''); showLogin(''); });
+  $('#refresh').addEventListener('click', load);
+  $('#range').addEventListener('change', function (e) { days = parseInt(e.target.value, 10) || 14; load(); });
+  $('#find').addEventListener('input', function (e) { filter = e.target.value; if (lastData) drawRecent(lastData); });
+  $('#viewTable').addEventListener('click', function () { $('#daysTable').classList.toggle('hidden'); });
+  $('#ver').textContent = VERSION;
+  load();
+})();
+`;
+
+// ============================================================================
 // HTTP SERVER
 // ============================================================================
 
@@ -2434,13 +3272,17 @@ class ApiServer {
     this.routes = [];
     this.server = null;
     this.hits = new Map();
+    this.authFails = new Map();
   }
 
-  get(pattern, handler) { this.routes.push({ parts: pattern.split('/').filter(Boolean), handler }); }
+  get(pattern, handler) { this.routes.push({ method: 'GET', parts: pattern.split('/').filter(Boolean), handler }); }
+  post(pattern, handler) { this.routes.push({ method: 'POST', parts: pattern.split('/').filter(Boolean), handler }); }
 
-  match(pathname) {
+  match(pathname, method) {
     const pp = pathname.split('/').filter(Boolean);
+    const want = method === 'HEAD' ? 'GET' : method;
     for (const r of this.routes) {
+      if (r.method !== want) continue;
       if (r.parts.length !== pp.length) continue;
       const params = {};
       let ok = true;
@@ -2454,13 +3296,52 @@ class ApiServer {
     return null;
   }
 
-  rateLimited(ip) {
+  rateLimited(ip, bucket = 'api', limit = CONFIG.RATE_LIMIT_PER_MIN) {
     const now = Date.now();
-    let h = this.hits.get(ip);
-    if (!h || now - h.start > 60000) { h = { start: now, n: 0 }; this.hits.set(ip, h); }
+    const key = bucket + ':' + ip;
+    let h = this.hits.get(key);
+    if (!h || now - h.start > 60000) { h = { start: now, n: 0 }; this.hits.set(key, h); }
     h.n++;
-    if (this.hits.size > 5000) { for (const [k, v] of this.hits) if (now - v.start > 60000) this.hits.delete(k); }
-    return h.n > CONFIG.RATE_LIMIT_PER_MIN;
+    if (this.hits.size > 8000) { for (const [k, v] of this.hits) if (now - v.start > 60000) this.hits.delete(k); }
+    return h.n > limit;
+  }
+
+  /** Dashboard/analytics auth: ADMIN_TOKEN must be configured; header only; brute-force throttled. */
+  analyticsAuth(req) {
+    if (!CONFIG.ADMIN_TOKEN) throw new HttpError(503, 'ADMIN_TOKEN is not set on the server', 'ADMIN_TOKEN_REQUIRED');
+    const ip = clientIp(req);
+    const now = Date.now();
+    const f = this.authFails.get(ip);
+    if (f && now - f.start < 10 * 60e3 && f.n >= 10) throw new HttpError(429, 'too many failed attempts', 'RATE_LIMITED');
+    const crypto = require('crypto');
+    const hash = v => crypto.createHash('sha256').update(String(v || '')).digest();
+    const ok = crypto.timingSafeEqual(hash(req.headers['x-admin-token']), hash(CONFIG.ADMIN_TOKEN));
+    if (!ok) {
+      const cur = f && now - f.start < 10 * 60e3 ? f : { start: now, n: 0 };
+      cur.n++;
+      this.authFails.set(ip, cur);
+      if (this.authFails.size > 2000) this.authFails.delete(this.authFails.keys().next().value);
+      throw new HttpError(403, 'invalid token', 'FORBIDDEN');
+    }
+    this.authFails.delete(ip);
+  }
+
+  readJsonBody(req, max = 4096) {
+    return new Promise((resolve, reject) => {
+      let size = 0;
+      const chunks = [];
+      req.on('data', c => {
+        size += c.length;
+        if (size > max) { reject(new HttpError(413, 'body too large', 'TOO_LARGE')); req.destroy(); return; }
+        chunks.push(c);
+      });
+      req.on('end', () => {
+        const txt = Buffer.concat(chunks).toString('utf8');
+        if (!txt) return resolve({});
+        try { resolve(JSON.parse(txt)); } catch (_) { reject(new HttpError(400, 'invalid json', 'BAD_REQUEST')); }
+      });
+      req.on('error', reject);
+    });
   }
 
   adminOk(req) {
@@ -2509,27 +3390,32 @@ class ApiServer {
     const method = (req.method || 'GET').toUpperCase();
 
     res.setHeader('Access-Control-Allow-Origin', CONFIG.CORS_ORIGIN);
-    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, X-Admin-Token');
     res.setHeader('Access-Control-Max-Age', '86400');
     res.setHeader('Vary', 'Origin');
     if (method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-    if (method !== 'GET' && method !== 'HEAD') { this.json(res, 405, { error: 'method not allowed', code: 'METHOD' }); return; }
+    const isTrack = method === 'POST' && pathname === '/api/track';
+    if (method !== 'GET' && method !== 'HEAD' && !isTrack) { this.json(res, 405, { error: 'method not allowed', code: 'METHOD' }); return; }
 
     if (this.serveStatic(res, pathname)) return;
 
-    const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
-    if (pathname.startsWith('/api/') && this.rateLimited(ip)) {
+    const ip = clientIp(req);
+    const bucket = pathname === '/api/img' ? ['img', CONFIG.IMG_RATE_PER_MIN] : isTrack ? ['track', CONFIG.TRACK_RATE_PER_MIN] : ['api', CONFIG.RATE_LIMIT_PER_MIN];
+    if (pathname.startsWith('/api/') && !pathname.startsWith('/api/admin/') && this.rateLimited(ip, bucket[0], bucket[1])) {
       this.json(res, 429, { error: 'too many requests', code: 'RATE_LIMITED', retryAfter: 30 }, { 'Retry-After': '30' });
       return;
     }
 
-    const m = this.match(pathname);
+    const m = this.match(pathname, method);
     if (!m) { this.json(res, 404, { error: 'Not found', code: 'NOT_FOUND', path: pathname }); return; }
 
     req.query = Object.fromEntries(parsed.searchParams);
     req.params = m.params;
-    try { await m.handler(req, res); } catch (err) { if (!res.headersSent) this.sendError(res, err); else res.end(); }
+    try {
+      if (isTrack) req.body = await this.readJsonBody(req);
+      await m.handler(req, res);
+    } catch (err) { if (!res.headersSent) this.sendError(res, err); else res.end(); }
   }
 
   start(port = CONFIG.PORT, host = CONFIG.HOST) {
@@ -2542,7 +3428,7 @@ class ApiServer {
   }
 }
 
-function setupRoutes(api, svc, store, site) {
+function setupRoutes(api, svc, store, site, img, analytics) {
   const qPage = req => clampInt(req.query.page, 1, 200, 1);
   const bool = v => v === '1' || v === 'true';
 
@@ -2638,6 +3524,47 @@ function setupRoutes(api, svc, store, site) {
     api.json(res, 200, { cleared: true });
   });
 
+  // ---- v3.1: image proxy ----------------------------------------------------
+  api.get('/api/img', async (req, res) => {
+    if (!req.query.u) throw new HttpError(400, 'missing u', 'BAD_REQUEST');
+    const e = await img.get(String(req.query.u));
+    const headers = {
+      'Content-Type': e.type, 'Content-Length': e.buf.length, 'ETag': e.etag,
+      'Cache-Control': 'public, max-age=604800, stale-while-revalidate=86400',
+      'X-Content-Type-Options': 'nosniff', 'Cross-Origin-Resource-Policy': 'cross-origin',
+      'Content-Security-Policy': "default-src 'none'"
+    };
+    if (req.headers['if-none-match'] === e.etag) { res.writeHead(304, { ETag: e.etag, 'Cache-Control': headers['Cache-Control'] }); res.end(); return; }
+    res.writeHead(200, headers);
+    res.end(req.method === 'HEAD' ? undefined : e.buf);
+  });
+
+  // ---- v3.1: visitor tracking (public) + dashboard (ADMIN_TOKEN) -------------
+  api.post('/api/track', async (req, res) => {
+    const r = analytics.track({
+      ip: clientIp(req), ua: req.headers['user-agent'] || '', body: req.body,
+      country: req.headers['cf-ipcountry'] || req.headers['x-vercel-ip-country'] || ''
+    });
+    api.json(res, 200, r);
+  });
+  api.get('/api/admin/analytics', async (req, res) => {
+    api.analyticsAuth(req);
+    if (!analytics.fb.enabled) throw new HttpError(503, 'FIREBASE_URL is not configured', 'FIREBASE_DISABLED');
+    try {
+      api.json(res, 200, await analytics.summary(req.query.days));
+    } catch (e) {
+      if (e instanceof HttpError) throw e;
+      Logger.warn('analytics summary failed:', e.message);
+      throw new HttpError(502, 'Firebase error: ' + e.message, 'FIREBASE_ERROR');
+    }
+  });
+  const dashHeaders = ctype => Object.assign({
+    'Content-Type': ctype, 'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'"
+  }, SECURITY_HEADERS);
+  api.get('/dashboard', async (req, res) => { res.writeHead(200, dashHeaders('text/html; charset=utf-8')); res.end(DASHBOARD_HTML); });
+  api.get('/dashboard.js', async (req, res) => { res.writeHead(200, dashHeaders('application/javascript; charset=utf-8')); res.end(DASHBOARD_JS); });
+
   api.get('/admin', async (req, res) => {
     if (!api.adminOk(req)) throw new HttpError(403, 'admin token required', 'FORBIDDEN');
     const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -2651,6 +3578,7 @@ function setupRoutes(api, svc, store, site) {
 <li><code>GET /api/home</code> • <code>/api/category/:cat?page=</code> • <code>/api/new</code> • <code>/api/search?q=&amp;page=</code> • <code>/api/suggest?q=</code></li>
 <li><code>GET /api/video/:vid</code> • <code>/api/video/:vid/sources?probe=1</code> • <code>/api/video/:vid/downloads</code> • <code>/api/series/:ser</code></li>
 <li><code>GET /health</code> • <code>/api/stats</code> • <code>/api/cache/clear</code> • <code>/api/scrape/full?limit=20</code> • <code>/api/export</code></li>
+<li><code>GET /api/img?u=</code> (بروكسي الصور) • <code>POST /api/track</code> (زوار) • <a href="/dashboard" style="color:#ff9a5e">/dashboard</a> (لوحة الزوار)</li>
 <li>مسارات v2 القديمة <code>/api/scrape/*</code> ما زالت تعمل.</li></ul></div></div></body></html>`;
     res.writeHead(200, Object.assign({ 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'" }, SECURITY_HEADERS));
     res.end(html);
@@ -2666,8 +3594,10 @@ function createApp() {
   const site = new SiteClient();
   const service = new LarozaService(store, site);
   const api = new ApiServer(service, store, site);
-  setupRoutes(api, service, store, site);
-  return { store, site, service, api };
+  const img = new ImageProxy(site);
+  const analytics = new Analytics(new FirebaseDB());
+  setupRoutes(api, service, store, site, img, analytics);
+  return { store, site, service, api, img, analytics };
 }
 
 async function main() {
@@ -2694,7 +3624,7 @@ async function main() {
 }
 
 module.exports = {
-  CONFIG, HtmlDoc, DataStore, SiteClient, LarozaService, ApiServer, TTLCache,
+  CONFIG, HtmlDoc, DataStore, SiteClient, LarozaService, ApiServer, TTLCache, ImageProxy, FirebaseDB, Analytics, parseUA, sniffImage,
   extractCards, extractPagination, extractSections, parseVideoPage, parseSeriesPage, parsePlayPage,
   collectMedia, classifyMedia, verifySource, normalizeArabic, createApp, main
 };
